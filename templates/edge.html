@@ -45,31 +45,33 @@
         </div>
 
         <div class="system-grid" id="edgeStateGrid">
-            {% if state %}
-                {% set label, css = status_label(state.status) %}
-                <div class="system-item">Statut: <span class="badge {{ css }}" id="edgeStatusBadge">{{ label }}</span></div>
-                <div class="system-item">Docker: <strong id="edgeDocker">{{ state.docker_version or 'absent' }}</strong></div>
-                <div class="system-item">Conteneur: <strong id="edgeContainer">{{ state.container_status or state.container_state }}</strong></div>
-                <div class="system-item">Postgres: <strong id="edgePostgres">{{ state.postgres_status or 'absent' }}</strong></div>
-                <div class="system-item">Cle Edge: <code id="edgeKeyState">{{ state.edge_key or 'non configuree' }}</code></div>
-                <div class="system-item">Serveur: <strong id="edgeCloud">{{ state.cloud_host or '-' }}:{{ state.cloud_port or '-' }}</strong></div>
-                <div class="system-item">Connexion serveur: <strong id="edgeConnected">{{ 'Oui' if state.cloud_connected else 'Non' }}</strong></div>
-                <div class="system-item">Interface locale:
-                    <strong id="edgeUrl">
-                        {% if state.edge_url %}<a href="{{ state.edge_url }}" target="_blank" rel="noopener">{{ state.edge_url }}</a>{% else %}-{% endif %}
-                    </strong>
-                </div>
-            {% else %}
-                <div class="system-item">Statut: <span class="badge badge-warning" id="edgeStatusBadge">Non verifie</span></div>
-                <div class="system-item">Docker: <strong id="edgeDocker">?</strong></div>
-                <div class="system-item">Conteneur: <strong id="edgeContainer">?</strong></div>
-                <div class="system-item">Postgres: <strong id="edgePostgres">?</strong></div>
-                <div class="system-item">Cle Edge: <code id="edgeKeyState">?</code></div>
-                <div class="system-item">Serveur: <strong id="edgeCloud">?</strong></div>
-                <div class="system-item">Connexion serveur: <strong id="edgeConnected">?</strong></div>
-                <div class="system-item">Interface locale: <strong id="edgeUrl">?</strong></div>
-            {% endif %}
+            {% set label, css = status_label(state.status) if state else ('Non verifie', 'badge-warning') %}
+            <div class="system-item">Statut: <span class="badge {{ css }}" id="edgeStatusBadge">{{ label }}</span></div>
+            <div class="system-item">OS / modele: <strong id="edgeOs">{{ (state.os_pretty or '?') if state else '?' }}</strong></div>
+            <div class="system-item">Docker: <strong id="edgeDocker">{{ (state.docker_version or 'absent') if state else '?' }}</strong></div>
+            <div class="system-item">Stockage Docker: <strong id="edgeDataRoot">{{ (state.docker_data_root or '-') if state else '?' }}</strong></div>
+            <div class="system-item">Image edge: <strong id="edgeImage">{{ ('presente' if state.image_present else 'ABSENTE') if state else '?' }}</strong></div>
+            <div class="system-item">Conteneur: <strong id="edgeContainer">{{ (state.container_status or state.container_state) if state else '?' }}</strong></div>
+            <div class="system-item">Postgres: <strong id="edgePostgres">{{ (state.postgres_status or 'absent') if state else '?' }}</strong></div>
+            <div class="system-item">Cle Edge: <code id="edgeKeyState">{{ (state.edge_key or 'non configuree') if state else '?' }}</code></div>
+            <div class="system-item">Serveur: <strong id="edgeCloud">{{ (state.cloud_host ~ ':' ~ state.cloud_port) if state and state.cloud_host else '?' }}</strong></div>
+            <div class="system-item">Connexion serveur: <strong id="edgeConnected">{{ ('Oui' if state.cloud_connected else 'Non') if state else '?' }}</strong></div>
+            <div class="system-item">Gateway I/O: <strong id="edgeGateway">{{ (state.gateway_service_state or 'absente') if state else '?' }}</strong></div>
+            <div class="system-item">Interface locale:
+                <strong id="edgeUrl">
+                    {% if state and state.edge_url %}<a href="{{ state.edge_url }}" target="_blank" rel="noopener">{{ state.edge_url }}</a>{% else %}?{% endif %}
+                </strong>
+            </div>
         </div>
+
+        {% if state and state.gateway_gpio_errors %}
+        <div class="warning" style="margin-top:12px">
+            <strong>Bug GPIO detecte :</strong> {{ state.gateway_gpio_errors }} erreur(s)
+            « Device or resource busy » / « port is not configure yet » dans les logs de la gateway.
+            À corriger dans <code>edge_gateway.py</code> avant toute containerisation
+            (ne pas masquer avec <code>privileged: true</code>).
+        </div>
+        {% endif %}
 
         <p class="small-muted" id="edgeHint">{{ state.cloud_hint if state and state.cloud_hint else 'Cliquez sur "Verifier maintenant" pour interroger la carte.' }}</p>
 
@@ -77,15 +79,54 @@
             <button class="btn btn-secondary btn-sm" onclick="controlEdge('start')">Demarrer</button>
             <button class="btn btn-secondary btn-sm" onclick="controlEdge('restart')">Redemarrer</button>
             <button class="btn btn-warning btn-sm" onclick="controlEdge('stop')">Arreter</button>
-            <button class="btn btn-secondary btn-sm" onclick="loadLogs()">Voir les logs</button>
+            <button class="btn btn-secondary btn-sm" onclick="loadLogs()">Logs tb-edge</button>
         </div>
+
+        <p class="small-muted" style="margin-top:14px"><strong>Gateway I/O Python</strong> (service <code>tb-edge-io.service</code>, natif) :</p>
+        <div class="btn-group">
+            <button class="btn btn-secondary btn-sm" onclick="gatewayControl('start')">Demarrer gateway</button>
+            <button class="btn btn-secondary btn-sm" onclick="gatewayControl('restart')">Redemarrer</button>
+            <button class="btn btn-warning btn-sm" onclick="gatewayControl('stop')">Arreter</button>
+            <button class="btn btn-secondary btn-sm" onclick="gatewayLogs()">Logs gateway</button>
+        </div>
+    </div>
+
+    <!-- ==================== CARTE DE REFERENCE (MAITRE) ==================== -->
+    <div class="card">
+        <div class="card-header">
+            <div>
+                <h2>1. Carte de reference</h2>
+                <p class="section-note">
+                    L'image <code>tb-edge</code> est <strong>customisee</strong> : son tag est absent des registres
+                    publics, elle doit donc etre transferee depuis la carte de reference
+                    (<code>docker save</code> → <code>docker load</code>). Les donnees de l'edge
+                    ne sont <strong>jamais</strong> repliquees.
+                </p>
+            </div>
+            <button class="btn btn-secondary" onclick="inspectMaster()">Inventorier</button>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>IP de la carte de reference</label>
+                <input type="text" id="master_ip" value="{{ settings.master_ip }}" placeholder="10.0.0.26">
+                <div class="help">Carte « techbase » pleinement fonctionnelle</div>
+            </div>
+            <div class="form-group">
+                <label>Image edge a repliquer</label>
+                <input type="text" id="edge_image" value="{{ settings.edge_image }}">
+                <div class="help">Tag custom, ~2.4 Go a l'export</div>
+            </div>
+        </div>
+
+        <div id="masterResult" class="tb-result"></div>
     </div>
 
     <!-- ================== SERVEUR THINGSBOARD (TENANT) ==================== -->
     <div class="card">
         <div class="card-header">
             <div>
-                <h2>1. Serveur ThingsBoard (optionnel mais recommande)</h2>
+                <h2>2. Serveur ThingsBoard — identite de la carte</h2>
                 <p class="section-note">
                     Connectez-vous au tenant pour verifier si un Edge existe deja, ou pour le
                     <strong>creer directement d'ici</strong> et recuperer automatiquement sa Cle et son Secret.
@@ -139,10 +180,11 @@
     <div class="card">
         <div class="card-header">
             <div>
-                <h2>2. Identifiants Edge et deploiement</h2>
+                <h2>3. Deploiement</h2>
                 <p class="section-note">
-                    Renseignez la <strong>Cle Edge</strong> et le <strong>Secret Edge</strong> de cette carte, puis lancez le deploiement.
-                    Chaque carte doit avoir sa propre paire Cle/Secret.
+                    Renseignez la <strong>Cle Edge</strong> et le <strong>Secret Edge</strong> propres a cette carte,
+                    puis lancez le deploiement : transfert de l'image, installation de Docker CE,
+                    demarrage de la stack, puis transfert de la gateway I/O.
                 </p>
             </div>
         </div>
@@ -173,8 +215,8 @@
                 </div>
                 <div class="form-group">
                     <label>Port RPC edge</label>
-                    <input type="number" id="cloud_port" value="{{ settings.cloud_port or 7070 }}">
-                    <div class="help">7070 par defaut</div>
+                    <input type="number" id="cloud_port" value="{{ settings.cloud_port or 7071 }}">
+                    <div class="help">7071 sur ce parc (et non 7070)</div>
                 </div>
                 <div class="form-group">
                     <label>SSL vers le serveur</label>
@@ -189,20 +231,23 @@
                 <summary>Options avancees</summary>
                 <div class="form-row" style="margin-top:12px">
                     <div class="form-group">
-                        <label>Version de l'image tb-edge</label>
-                        <input type="text" id="edge_version" value="{{ settings.edge_version or default_edge_version }}">
-                    </div>
-                    <div class="form-group">
                         <label>Repertoire d'installation</label>
                         <input type="text" id="edge_dir" value="{{ settings.edge_dir }}">
+                        <div class="help">Identique a la carte de reference</div>
                     </div>
                     <div class="form-group">
-                        <label>Port HTTP local</label>
-                        <input type="number" id="edge_http_port" value="{{ settings.edge_http_port or 8080 }}">
+                        <label>Projet docker compose</label>
+                        <input type="text" id="compose_project" value="{{ settings.compose_project }}">
                     </div>
                     <div class="form-group">
-                        <label>Port MQTT local</label>
-                        <input type="number" id="edge_mqtt_port" value="{{ settings.edge_mqtt_port or 1883 }}">
+                        <label>Port HTTP hote</label>
+                        <input type="number" id="edge_http_port" value="{{ settings.edge_http_port or 8082 }}">
+                        <div class="help">8082 → 8080 dans le conteneur</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Port MQTT hote</label>
+                        <input type="number" id="edge_mqtt_port" value="{{ settings.edge_mqtt_port or 1884 }}">
+                        <div class="help">1884 : 1883 est pris par mosquitto</div>
                     </div>
                 </div>
                 <div class="form-row">
@@ -218,20 +263,31 @@
                         <label>Mot de passe Postgres local</label>
                         <input type="text" id="pg_password" value="postgres">
                     </div>
+                    <div class="form-group">
+                        <label>Stockage Docker (SSD)</label>
+                        <input type="text" id="docker_data_root" value="{{ settings.docker_data_root }}" placeholder="/mnt/ssd/docker">
+                        <div class="help">Vide = emplacement par defaut</div>
+                    </div>
                 </div>
                 <div class="checkbox-grid">
-                    <label class="checkbox"><input type="checkbox" id="reset_data" checked> Purger la base locale (obligatoire sur une image clonee)</label>
-                    <label class="checkbox"><input type="checkbox" id="set_hostname" {{ 'checked' if settings.set_hostname else '' }}> Definir un hostname unique depuis le serial</label>
-                    <label class="checkbox"><input type="checkbox" id="install_docker" {{ 'checked' if settings.install_docker else '' }}> Installer Docker si absent</label>
-                    <label class="checkbox"><input type="checkbox" id="pull_images" checked> Telecharger les images Docker</label>
+                    <label class="checkbox"><input type="checkbox" id="transfer_image" {{ 'checked' if settings.transfer_image else '' }}> Transferer l'image edge depuis la carte de reference</label>
+                    <label class="checkbox"><input type="checkbox" id="install_docker" {{ 'checked' if settings.install_docker else '' }}> Installer Docker CE si absent</label>
+                    <label class="checkbox"><input type="checkbox" id="reset_data" checked> Purger les volumes de donnees (obligatoire sur image clonee)</label>
+                    <label class="checkbox"><input type="checkbox" id="set_hostname" {{ 'checked' if settings.set_hostname else '' }}> Hostname unique derive du serial</label>
+                    <label class="checkbox"><input type="checkbox" id="pull_images" checked> Recuperer postgres:16</label>
                     <label class="checkbox"><input type="checkbox" id="start_edge" checked> Demarrer l'Edge a la fin</label>
+                    <label class="checkbox"><input type="checkbox" id="transfer_gateway" {{ 'checked' if settings.transfer_gateway else '' }}> Transferer la gateway I/O (/opt/mobilis-gateway)</label>
+                    <label class="checkbox"><input type="checkbox" id="install_gateway_service" {{ 'checked' if settings.install_gateway_service else '' }}> Installer l'unite tb-edge-io.service</label>
+                    <label class="checkbox"><input type="checkbox" id="enable_gateway_service"> Demarrer la gateway (bug GPIO non corrige)</label>
                 </div>
             </details>
 
             <div class="warning" style="margin-top:14px">
                 <strong>Important :</strong> le deploiement arrete la stack existante, reecrit
                 <code>{{ settings.edge_dir }}/.env</code> et <code>docker-compose.yml</code>, puis redemarre l'Edge.
-                Avec « Purger la base locale » coche, l'historique local de l'Edge est efface (indispensable apres clonage d'une Master Image).
+                « Purger les volumes » supprime la base locale de l'edge — <strong>indispensable</strong> sur une carte
+                issue d'une image clonee, sinon elle repart avec l'identite et l'historique de la carte de reference.
+                La gateway I/O est installee mais <strong>non demarree</strong> par defaut, le bug GPIO devant etre corrige au prealable.
             </div>
 
             <div class="btn-group">
@@ -311,18 +367,70 @@ function renderState(state, label, cssClass) {
     badge.textContent = label;
     badge.className = 'badge ' + (cssClass || 'badge-warning');
 
+    el('edgeOs').textContent = state.os_pretty || '?';
     el('edgeDocker').textContent = state.docker_version || 'absent';
+    el('edgeDataRoot').textContent = state.docker_data_root || '-';
+    el('edgeImage').textContent = state.image_present ? 'presente' : 'ABSENTE';
     el('edgeContainer').textContent = state.container_status || state.container_state || 'absent';
     el('edgePostgres').textContent = state.postgres_status || 'absent';
     el('edgeKeyState').textContent = state.edge_key || 'non configuree';
     el('edgeCloud').textContent = (state.cloud_host || '-') + ':' + (state.cloud_port || '-');
     el('edgeConnected').textContent = state.cloud_connected ? 'Oui' : 'Non';
+    el('edgeGateway').textContent = state.gateway_service_state || (state.gateway_present ? 'fichiers presents' : 'absente');
     el('edgeUrl').innerHTML = state.edge_url
         ? `<a href="${state.edge_url}" target="_blank" rel="noopener">${state.edge_url}</a>` : '-';
-    el('edgeHint').textContent = state.error || state.cloud_hint || 'Etat mis a jour.';
+
+    let hint = state.error || state.cloud_hint || 'Etat mis a jour.';
+    if (state.gateway_gpio_errors) {
+        hint += `  |  ${state.gateway_gpio_errors} erreur(s) GPIO dans les logs de la gateway.`;
+    }
+    el('edgeHint').textContent = hint;
 
     if (state.edge_key && !el('edge_key').value) el('edge_key').value = state.edge_key;
     if (state.cloud_host && !el('cloud_host').value) el('cloud_host').value = state.cloud_host;
+    if (state.edge_image && !el('edge_image').value) el('edge_image').value = state.edge_image;
+}
+
+// ------------------------------------------------------ CARTE DE REFERENCE
+function inspectMaster() {
+    const box = el('masterResult');
+    box.className = 'tb-result';
+    box.textContent = 'Inventaire de la carte de reference...';
+
+    post('/api/master/inspect', { master_ip: el('master_ip').value.trim() }).then(({ data }) => {
+        const master = data.master || {};
+        if (!data.success) {
+            box.className = 'tb-result tb-error';
+            box.textContent = master.error || data.error || 'Carte de reference injoignable.';
+            return;
+        }
+
+        let html = `Carte <strong>${master.hostname || master.ip}</strong> (${master.ip})<br>
+                    Docker : ${master.docker_version || 'absent'}<br>
+                    Compose : ${master.compose_present ? `<code>${master.compose_path}</code>` : 'absent'}<br>`;
+
+        if (master.edge_images && master.edge_images.length) {
+            html += 'Images edge disponibles :<ul>';
+            master.edge_images.forEach(item => {
+                html += `<li><code>${item.image}</code> — ${item.size}
+                         <button class="btn btn-secondary btn-sm" style="margin-left:6px"
+                            onclick="el('edge_image').value='${item.image}'">Choisir</button></li>`;
+            });
+            html += '</ul>';
+        } else {
+            html += 'Aucune image tb-edge trouvee sur la carte de reference.<br>';
+        }
+
+        html += `Gateway I/O : ${master.gateway_present
+            ? `${master.gateway_files.length} fichier(s), service ${master.gateway_service_state || '?'}`
+            : 'absente'}`;
+
+        box.className = 'tb-result ' + (master.edge_images.length ? 'tb-ok' : 'tb-warn');
+        box.innerHTML = html;
+    }).catch(e => {
+        box.className = 'tb-result tb-error';
+        box.textContent = 'Erreur: ' + e;
+    });
 }
 
 // ------------------------------------------------------- THINGSBOARD API
@@ -385,15 +493,22 @@ function createEdge() {
     post('/api/tb/edge/create', Object.assign(tbCreds(), {
         name: name,
         type: el('new_edge_type').value.trim() || 'default',
-        label: el('new_edge_label').value.trim()
+        label: el('new_edge_label').value.trim(),
+        target_ip: IP
     })).then(({ data }) => {
         if (!data.success) { showTb('Erreur: ' + data.error, 'tb-error'); return; }
         const edge = data.edge;
-        showTb(`${data.message}<br>
+        let html = `${data.message}<br>
                 Nom : <strong>${edge.name}</strong><br>
                 Cle Edge : <code>${edge.routing_key}</code><br>
-                Secret Edge : <code>${edge.secret || 'non expose'}</code><br>
-                <em>Identifiants reportes automatiquement dans le formulaire ci-dessous.</em>`, 'tb-ok');
+                Secret Edge : <code>${edge.secret || 'non expose'}</code><br>`;
+        if (data.warning) {
+            html += `<br><strong>Attention :</strong> ${data.warning}`;
+            showTb(html, 'tb-warn');
+        } else {
+            html += `<em>Identifiants reportes automatiquement dans le formulaire ci-dessous.</em>`;
+            showTb(html, 'tb-ok');
+        }
         useCreds(edge.routing_key, edge.secret, edge.name);
     }).catch(e => showTb('Erreur: ' + e, 'tb-error'));
 }
@@ -413,21 +528,34 @@ function deployEdge() {
         cloud_host: el('cloud_host').value.trim(),
         cloud_port: el('cloud_port').value,
         cloud_ssl: el('cloud_ssl').value === '1',
-        edge_version: el('edge_version').value.trim(),
+        master_ip: el('master_ip').value.trim(),
+        edge_image: el('edge_image').value.trim(),
         edge_dir: el('edge_dir').value.trim(),
+        compose_project: el('compose_project').value.trim(),
         edge_http_port: el('edge_http_port').value,
         edge_mqtt_port: el('edge_mqtt_port').value,
         edge_name: el('edge_name').value.trim(),
         hostname_prefix: el('hostname_prefix').value.trim(),
         pg_password: el('pg_password').value,
+        docker_data_root: el('docker_data_root').value.trim(),
         reset_data: el('reset_data').checked,
         set_hostname: el('set_hostname').checked,
         install_docker: el('install_docker').checked,
         pull_images: el('pull_images').checked,
-        start_edge: el('start_edge').checked
+        start_edge: el('start_edge').checked,
+        transfer_image: el('transfer_image').checked,
+        transfer_gateway: el('transfer_gateway').checked,
+        install_gateway_service: el('install_gateway_service').checked,
+        enable_gateway_service: el('enable_gateway_service').checked
     };
 
-    if (!confirm(`Deployer ThingsBoard Edge sur ${IP} ?\n\nCle: ${payload.edge_key}\nServeur: ${payload.cloud_host}:${payload.cloud_port}`)) return;
+    let recap = `Deployer ThingsBoard Edge sur ${IP} ?\n\n`
+        + `Cle Edge : ${payload.edge_key}\n`
+        + `Serveur  : ${payload.cloud_host}:${payload.cloud_port}\n`
+        + `Image    : ${payload.edge_image}\n`;
+    if (payload.transfer_image) recap += `\nL'image (~2.4 Go) sera transferee depuis ${payload.master_ip}.\nCompter plusieurs dizaines de minutes.`;
+    if (payload.reset_data) recap += `\n\nLes volumes de donnees existants seront SUPPRIMES.`;
+    if (!confirm(recap)) return;
 
     const btn = el('deployBtn');
     btn.disabled = true;
@@ -440,6 +568,9 @@ function deployEdge() {
     post(`/api/edge/${IP}/deploy`, payload).then(({ ok, data }) => {
         if (!data.success) {
             setConsole('ERREUR: ' + (data.error || 'deploiement refuse'));
+            if (data.error && data.error.indexOf('deja') !== -1) {
+                el('edge_key').focus();
+            }
             el('jobBadge').textContent = 'erreur';
             el('jobBadge').className = 'badge badge-danger';
             btn.disabled = false;
@@ -505,6 +636,30 @@ function loadLogs() {
     fetch(`/api/edge/${IP}/logs?lines=200`)
         .then(r => r.json())
         .then(data => setConsole(data.logs || 'Aucun log.'))
+        .catch(e => logLine('Erreur: ' + e));
+}
+
+// ---------------------------------------------------------------- GATEWAY
+function gatewayControl(action) {
+    const labels = { start: 'Demarrer', stop: 'Arreter', restart: 'Redemarrer' };
+    let message = `${labels[action] || action} la gateway I/O sur ${IP} ?`;
+    if (action === 'start' || action === 'restart') {
+        message += '\n\nRappel : le bug GPIO ("Device or resource busy") n\'est pas corrige.';
+    }
+    if (!confirm(message)) return;
+
+    logLine(`> Gateway ${action} sur ${IP}...`);
+    post(`/api/edge/${IP}/gateway/control`, { action }).then(({ data }) => {
+        logLine(data.message || data.error || (data.success ? 'OK' : 'Echec'));
+        probeEdge();
+    }).catch(e => logLine('Erreur: ' + e));
+}
+
+function gatewayLogs() {
+    logLine('> Recuperation des logs de la gateway...');
+    fetch(`/api/edge/${IP}/gateway/logs?lines=200`)
+        .then(r => r.json())
+        .then(data => setConsole(data.logs || data.error || 'Aucun log.'))
         .catch(e => logLine('Erreur: ' + e));
 }
 

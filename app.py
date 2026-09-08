@@ -19,6 +19,7 @@ import paramiko
 from flask import Flask, flash, jsonify, redirect, render_template, request, session, url_for
 
 import tb_edge
+import tb_master
 from jobs import manager as job_manager
 from tb_cloud import ThingsBoardClient, ThingsBoardError
 
@@ -38,21 +39,29 @@ DEFAULT_WEB_IDENTITY = os.environ.get("MODBERRY_WEB_IDENTITY", "admin-ip")
 DEFAULT_WEB_EMAIL = os.environ.get("MODBERRY_WEB_EMAIL", "admin-ip@modberry.local")
 DEFAULT_WEB_PASSWORD = os.environ.get("MODBERRY_WEB_PASSWORD", "takieddine")
 
+# Valeurs par defaut alignees sur la carte de reference techbase (10.0.0.26).
 DEFAULT_EDGE_SETTINGS = {
-    "cloud_host": os.environ.get("MODBERRY_TB_HOST", ""),
-    "cloud_port": int(os.environ.get("MODBERRY_TB_RPC_PORT", "7070")),
+    "cloud_host": os.environ.get("MODBERRY_TB_HOST", "10.0.0.1"),
+    "cloud_port": int(os.environ.get("MODBERRY_TB_RPC_PORT", "7071")),
     "cloud_ssl": False,
     "cloud_web_url": os.environ.get("MODBERRY_TB_URL", ""),
-    "edge_version": tb_edge.DEFAULT_EDGE_VERSION,
+    "master_ip": os.environ.get("MODBERRY_MASTER_IP", tb_master.DEFAULT_MASTER_IP),
+    "edge_image": tb_edge.DEFAULT_EDGE_IMAGE,
     "edge_dir": tb_edge.DEFAULT_EDGE_DIR,
+    "compose_project": tb_edge.DEFAULT_COMPOSE_PROJECT,
     "edge_http_port": tb_edge.DEFAULT_EDGE_HTTP_PORT,
-    "edge_mqtt_port": 1883,
+    "edge_mqtt_port": tb_edge.DEFAULT_EDGE_MQTT_PORT,
+    "docker_data_root": "",
     "hostname_prefix": "modberry",
     "install_docker": True,
     "reset_data": True,
     "set_hostname": True,
     "pull_images": True,
     "start_edge": True,
+    "transfer_image": True,
+    "transfer_gateway": True,
+    "install_gateway_service": True,
+    "enable_gateway_service": False,  # bug GPIO a corriger avant demarrage
 }
 
 scan_lock = threading.Lock()
@@ -91,6 +100,7 @@ def load_config():
         "last_scan": None,
         "edge_settings": dict(DEFAULT_EDGE_SETTINGS),
         "edge_states": {},
+        "edge_assignments": {},
     }
 
     if os.path.exists(CONFIG_FILE):
@@ -103,6 +113,7 @@ def load_config():
         config.setdefault("networks", [])
         config.setdefault("last_scan", None)
         config.setdefault("edge_states", {})
+        config.setdefault("edge_assignments", {})
 
         edge_settings = config.setdefault("edge_settings", {})
         for key, value in DEFAULT_EDGE_SETTINGS.items():
@@ -416,6 +427,12 @@ def compute_next_auto_scan_at(config):
         return None
 
 
+def can_start_scan():
+    """Vrai si aucun scan n'est deja en cours."""
+    with scan_lock:
+        return not scan_state["running"]
+
+
 def trigger_scan(source="manual"):
     with scan_lock:
         if scan_state["running"]:
@@ -726,6 +743,40 @@ def find_device(ip):
     return None
 
 
+def get_key_assignments(exclude_ip=None):
+    """
+    Retourne {routing_key: ip} des cles Edge deja affectees.
+
+    Sert a empecher qu'une meme paire Cle/Secret soit deployee sur deux cartes :
+    deux edges partageant la meme identite entrent en conflit sur le serveur.
+    """
+    config = load_config()
+    assignments = {}
+
+    for ip, state in config.get("edge_states", {}).items():
+        key = (state or {}).get("edge_key")
+        if key and str(ip) != str(exclude_ip):
+            assignments[key] = ip
+
+    for ip, record in config.get("edge_assignments", {}).items():
+        key = (record or {}).get("edge_key")
+        if key and str(ip) != str(exclude_ip):
+            assignments[key] = ip
+
+    return assignments
+
+
+def record_key_assignment(ip, edge_key, edge_name=None):
+    """Memorise la cle affectee a une carte (registre du parc)."""
+    config = load_config()
+    config.setdefault("edge_assignments", {})[ip] = {
+        "edge_key": edge_key,
+        "edge_name": edge_name,
+        "assigned_at": iso_now(),
+    }
+    save_config(config)
+
+
 def store_edge_state(ip, state):
     """Persiste l'etat Edge d'une carte et met a jour la colonne tb_edge."""
     config = load_config()
@@ -763,10 +814,28 @@ def parse_int(value, default):
 @login_required
 def edge_page(ip):
     """Page de configuration ThingsBoard Edge pour une carte."""
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        flash("Adresse IP invalide.", "error")
+        return redirect(url_for("dashboard"))
+
     device = find_device(ip)
     if not device:
-        flash("Peripherique non trouve. Relancez un scan.", "error")
-        return redirect(url_for("dashboard"))
+        # Carte pas encore scannee : on autorise la configuration directe par IP,
+        # utile pour provisionner une carte neuve avant tout scan complet.
+        device = {
+            "ip": ip,
+            "hostname": "inconnu (hors scan)",
+            "serial": "",
+            "subnet": "",
+            "ssh": True,
+            "kind": "manual",
+        }
+        flash(
+            f"{ip} n'apparait pas dans le dernier scan : la page est ouverte en saisie directe.",
+            "info",
+        )
 
     config = load_config()
     settings = config.get("edge_settings", dict(DEFAULT_EDGE_SETTINGS))
@@ -813,14 +882,16 @@ def api_edge_deploy(ip):
         "edge_key": (payload.get("edge_key") or "").strip(),
         "edge_secret": (payload.get("edge_secret") or "").strip(),
         "cloud_host": (payload.get("cloud_host") or settings.get("cloud_host") or "").strip(),
-        "cloud_port": parse_int(payload.get("cloud_port"), settings.get("cloud_port", 7070)),
+        "cloud_port": parse_int(payload.get("cloud_port"), settings.get("cloud_port", tb_edge.DEFAULT_CLOUD_RPC_PORT)),
         "cloud_ssl": parse_bool(payload.get("cloud_ssl", settings.get("cloud_ssl", False))),
-        "edge_version": (payload.get("edge_version") or settings.get("edge_version") or tb_edge.DEFAULT_EDGE_VERSION).strip(),
+        "edge_image": (payload.get("edge_image") or settings.get("edge_image") or tb_edge.DEFAULT_EDGE_IMAGE).strip(),
         "edge_dir": (payload.get("edge_dir") or settings.get("edge_dir") or tb_edge.DEFAULT_EDGE_DIR).strip(),
-        "edge_http_port": parse_int(payload.get("edge_http_port"), settings.get("edge_http_port", 8080)),
-        "edge_mqtt_port": parse_int(payload.get("edge_mqtt_port"), settings.get("edge_mqtt_port", 1883)),
+        "compose_project": (payload.get("compose_project") or settings.get("compose_project") or tb_edge.DEFAULT_COMPOSE_PROJECT).strip(),
+        "edge_http_port": parse_int(payload.get("edge_http_port"), settings.get("edge_http_port", tb_edge.DEFAULT_EDGE_HTTP_PORT)),
+        "edge_mqtt_port": parse_int(payload.get("edge_mqtt_port"), settings.get("edge_mqtt_port", tb_edge.DEFAULT_EDGE_MQTT_PORT)),
         "edge_name": (payload.get("edge_name") or "").strip(),
         "pg_password": (payload.get("pg_password") or "postgres").strip(),
+        "docker_data_root": (payload.get("docker_data_root") or settings.get("docker_data_root") or "").strip(),
         "reset_data": parse_bool(payload.get("reset_data", True)),
         "set_hostname": parse_bool(payload.get("set_hostname", settings.get("set_hostname", True))),
         "hostname_prefix": (payload.get("hostname_prefix") or settings.get("hostname_prefix") or "modberry").strip(),
@@ -828,6 +899,13 @@ def api_edge_deploy(ip):
         "pull_images": parse_bool(payload.get("pull_images", True)),
         "start_edge": parse_bool(payload.get("start_edge", True)),
     }
+
+    # Etapes de replication depuis la carte de reference
+    master_ip = (payload.get("master_ip") or settings.get("master_ip") or tb_master.DEFAULT_MASTER_IP).strip()
+    do_transfer_image = parse_bool(payload.get("transfer_image", settings.get("transfer_image", True)))
+    do_transfer_gateway = parse_bool(payload.get("transfer_gateway", settings.get("transfer_gateway", True)))
+    install_gateway_service = parse_bool(payload.get("install_gateway_service", settings.get("install_gateway_service", True)))
+    enable_gateway_service = parse_bool(payload.get("enable_gateway_service", False))
 
     valid, error = tb_edge.validate_edge_key(options["edge_key"])
     if not valid:
@@ -839,19 +917,33 @@ def api_edge_deploy(ip):
     if not valid:
         return jsonify({"success": False, "error": error}), 400
 
+    # Garde-fou : une meme identite Edge ne peut pas servir sur deux cartes.
+    unique, error = tb_edge.check_key_not_reused(
+        options["edge_key"], ip, get_key_assignments(exclude_ip=ip)
+    )
+    if not unique:
+        return jsonify({"success": False, "error": error}), 409
+
+    if str(master_ip) == str(ip):
+        do_transfer_image = False
+        do_transfer_gateway = False
+
     # Memorise les reglages reutilisables (jamais la cle/secret specifiques)
     save_edge_settings(
         {
             "cloud_host": options["cloud_host"],
             "cloud_port": options["cloud_port"],
             "cloud_ssl": options["cloud_ssl"],
-            "edge_version": options["edge_version"],
+            "edge_image": options["edge_image"],
             "edge_dir": options["edge_dir"],
+            "compose_project": options["compose_project"],
             "edge_http_port": options["edge_http_port"],
             "edge_mqtt_port": options["edge_mqtt_port"],
+            "docker_data_root": options["docker_data_root"],
             "hostname_prefix": options["hostname_prefix"],
             "install_docker": options["install_docker"],
             "set_hostname": options["set_hostname"],
+            "master_ip": master_ip,
         }
     )
 
@@ -859,23 +951,70 @@ def api_edge_deploy(ip):
     job_key = f"deploy:{ip}"
 
     def target(job):
-        job.log(f"Deploiement ThingsBoard Edge sur {ip}")
-        job.log(f"Serveur cible  : {options['cloud_host']}:{options['cloud_port']} (ssl={options['cloud_ssl']})")
-        job.log(f"Cle Edge       : {options['edge_key']}")
-        job.log(f"Secret Edge    : {tb_edge.mask_secret(options['edge_secret'])}")
-        job.log(f"Version Edge   : {options['edge_version']}")
-        job.log(f"Reset data     : {options['reset_data']} | Hostname unique: {options['set_hostname']}")
+        job.log(f"=== Provisioning de {ip} ===")
+        job.log(f"Carte de reference : {master_ip}")
+        job.log(f"Serveur ThingsBoard: {options['cloud_host']}:{options['cloud_port']} (ssl={options['cloud_ssl']})")
+        job.log(f"Cle Edge           : {options['edge_key']}")
+        job.log(f"Secret Edge        : {tb_edge.mask_secret(options['edge_secret'])}")
+        job.log(f"Image edge         : {options['edge_image']}")
+        job.log(f"Projet compose     : {options['compose_project']} dans {options['edge_dir']}")
+        job.log(f"Ports hote         : HTTP {options['edge_http_port']} | MQTT {options['edge_mqtt_port']}")
+        job.log(f"Reset volumes      : {options['reset_data']} | Hostname unique: {options['set_hostname']}")
 
+        # ---- Etape 1 : image Docker custom (absente des registres publics)
+        if do_transfer_image:
+            job.log("")
+            job.log("--- Etape 1/3 : image Docker custom ---")
+            ok, message = tb_master.transfer_edge_image(
+                master_ip, ip, user, password,
+                image=options["edge_image"], on_line=job.log,
+            )
+            job.log(message)
+            if not ok:
+                return False, f"Transfert de l'image interrompu: {message}"
+        else:
+            job.log("")
+            job.log("--- Etape 1/3 : transfert d'image ignore ---")
+
+        # ---- Etape 2 : Docker CE + compose + demarrage
+        job.log("")
+        job.log("--- Etape 2/3 : provisioning de la stack ---")
         ok, message = tb_edge.deploy_edge(ip, user, password, options, job.log)
 
+        if ok:
+            record_key_assignment(ip, options["edge_key"], options.get("edge_name"))
+
+        # ---- Etape 3 : gateway I/O Python
+        if ok and do_transfer_gateway:
+            job.log("")
+            job.log("--- Etape 3/3 : gateway I/O Python ---")
+            gateway_ok, gateway_message = tb_master.transfer_gateway(
+                master_ip, ip, user, password,
+                on_line=job.log,
+                install_service=install_gateway_service,
+                enable_service=enable_gateway_service,
+            )
+            job.log(gateway_message)
+            if not gateway_ok:
+                job.log("AVERTISSEMENT: la stack Edge est en place, mais la gateway a echoue.")
+        elif ok:
+            job.log("")
+            job.log("--- Etape 3/3 : transfert de la gateway ignore ---")
+
+        # ---- Verification finale
+        job.log("")
         job.log("Verification de l'etat apres deploiement...")
         try:
             state = tb_edge.probe_edge(ip, user, password, edge_dir=options["edge_dir"])
             store_edge_state(ip, state)
-            label = tb_edge.status_label(state.get("status"))[0]
-            job.log(f"Etat courant   : {label}")
+            job.log(f"Etat courant       : {tb_edge.status_label(state.get('status'))[0]}")
             if state.get("cloud_hint"):
-                job.log(f"Indice logs    : {state['cloud_hint']}")
+                job.log(f"Indice logs        : {state['cloud_hint']}")
+            if state.get("gateway_gpio_errors"):
+                job.log(
+                    f"ATTENTION: {state['gateway_gpio_errors']} erreur(s) GPIO dans les logs "
+                    "de la gateway (Device or resource busy) - bug a corriger."
+                )
             job.meta["state"] = state
         except Exception as exception:
             job.log(f"Verification impossible: {exception}")
@@ -926,7 +1065,12 @@ def api_edge_control(ip):
     settings = get_edge_settings()
     user, password = ssh_credentials()
     ok, message = tb_edge.control_edge(
-        ip, user, password, action, edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR)
+        ip,
+        user,
+        password,
+        action,
+        edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR),
+        compose_project=settings.get("compose_project", tb_edge.DEFAULT_COMPOSE_PROJECT),
     )
 
     state = None
@@ -1076,11 +1220,17 @@ def api_tb_edge_create():
 
         existing = client.find_edge_by_name(name)
         if existing:
+            summary = client.edge_summary(existing)
+            target_ip = (payload.get("target_ip") or "").strip()
+            unique, warning = tb_edge.check_key_not_reused(
+                summary.get("routing_key"), target_ip, get_key_assignments(exclude_ip=target_ip)
+            )
             return jsonify(
                 {
                     "success": True,
                     "created": False,
-                    "edge": client.edge_summary(existing),
+                    "edge": summary,
+                    "warning": None if unique else warning,
                     "message": f"Un Edge nomme '{name}' existe deja, ses identifiants sont reutilises.",
                 }
             )
@@ -1103,6 +1253,145 @@ def api_tb_edge_create():
 def api_edge_states():
     """Retourne les derniers etats Edge connus, par IP."""
     return jsonify(load_config().get("edge_states", {}))
+
+
+# ------------------------- Carte de reference et gateway I/O -----------------
+
+
+@app.route("/api/master/inspect", methods=["GET", "POST"])
+@login_required
+def api_master_inspect():
+    """Inventorie la carte de reference (image edge, compose, gateway)."""
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    settings = get_edge_settings()
+    master_ip = (
+        payload.get("master_ip")
+        or request.args.get("master_ip")
+        or settings.get("master_ip")
+        or tb_master.DEFAULT_MASTER_IP
+    ).strip()
+
+    valid, error = tb_edge.validate_host(master_ip)
+    if not valid:
+        return jsonify({"success": False, "error": error}), 400
+
+    user, password = ssh_credentials()
+    info = tb_master.inspect_master(
+        master_ip, user, password, edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR)
+    )
+
+    if master_ip != settings.get("master_ip"):
+        save_edge_settings({"master_ip": master_ip})
+
+    return jsonify({"success": bool(info.get("reachable")), "master": info})
+
+
+@app.route("/api/edge/<ip>/gateway", methods=["GET"])
+@login_required
+def api_gateway_state(ip):
+    """Etat de la gateway I/O Python sur une carte."""
+    user, password = ssh_credentials()
+    return jsonify({"success": True, "gateway": tb_master.probe_gateway(ip, user, password)})
+
+
+@app.route("/api/edge/<ip>/gateway/transfer", methods=["POST"])
+@login_required
+def api_gateway_transfer(ip):
+    """Transfere la gateway I/O depuis la carte de reference (tache de fond)."""
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    settings = get_edge_settings()
+    master_ip = (payload.get("master_ip") or settings.get("master_ip") or tb_master.DEFAULT_MASTER_IP).strip()
+
+    if str(master_ip) == str(ip):
+        return jsonify({"success": False, "error": "La cible est la carte de reference elle-meme."}), 400
+
+    install_service = parse_bool(payload.get("install_service", True))
+    enable_service = parse_bool(payload.get("enable_service", False))
+    user, password = ssh_credentials()
+
+    def target(job):
+        job.log(f"Transfert de la gateway I/O de {master_ip} vers {ip}")
+        if enable_service:
+            job.log(
+                "ATTENTION: demarrage du service demande alors que le bug GPIO "
+                "(Device or resource busy) n'est pas corrige."
+            )
+        return tb_master.transfer_gateway(
+            master_ip, ip, user, password,
+            on_line=job.log,
+            install_service=install_service,
+            enable_service=enable_service,
+        )
+
+    started, job = job_manager.start(
+        f"deploy:{ip}", f"Gateway I/O {ip}", target, meta={"ip": ip, "kind": "gateway"}
+    )
+    if not started:
+        return jsonify(
+            {"success": True, "started": False, "running": True, "job": job.snapshot(0),
+             "message": "Une operation est deja en cours sur cette carte."}
+        ), 202
+
+    return jsonify({"success": True, "started": True, "running": True, "job": job.snapshot(0)}), 202
+
+
+@app.route("/api/edge/<ip>/gateway/control", methods=["POST"])
+@login_required
+def api_gateway_control(ip):
+    """start | stop | restart | enable | disable du service tb-edge-io."""
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    action = (payload.get("action") or "").strip()
+    if action not in {"start", "stop", "restart", "enable", "disable", "status"}:
+        return jsonify({"success": False, "error": f"Action invalide: {action}"}), 400
+
+    user, password = ssh_credentials()
+    sudo = "" if user == "root" else "sudo -n "
+    try:
+        with tb_edge.SSHSession(ip, user, password) as ssh:
+            if action == "status":
+                output = ssh.out(f"systemctl status {tb_edge.GATEWAY_SERVICE} --no-pager | head -20")
+                return jsonify({"success": True, "message": output or "Service introuvable."})
+
+            rc, out, err = ssh.run(f"{sudo}systemctl {action} {tb_edge.GATEWAY_SERVICE} 2>&1", timeout=90)
+            state = ssh.out(f"systemctl is-active {tb_edge.GATEWAY_SERVICE} 2>/dev/null || echo absent")
+            message = (out or err or f"Action '{action}' executee.").strip()
+            return jsonify(
+                {"success": rc == 0, "message": f"{message} (etat: {state})", "service_state": state}
+            ), (200 if rc == 0 else 500)
+    except Exception as exception:
+        return jsonify({"success": False, "error": f"Erreur SSH: {exception}"}), 500
+
+
+@app.route("/api/edge/<ip>/gateway/logs")
+@login_required
+def api_gateway_logs(ip):
+    """Logs de la gateway I/O, avec mise en evidence des erreurs GPIO."""
+    lines = parse_int(request.args.get("lines"), 200)
+    user, password = ssh_credentials()
+    try:
+        with tb_edge.SSHSession(ip, user, password) as ssh:
+            logs = ssh.out(
+                f"tail -n {lines} {tb_edge.GATEWAY_LOG} 2>/dev/null "
+                f"|| journalctl -u {tb_edge.GATEWAY_SERVICE} -n {lines} --no-pager 2>/dev/null",
+                timeout=60,
+            )
+            return jsonify({"success": True, "logs": logs or "Aucun log disponible."})
+    except Exception as exception:
+        return jsonify({"success": False, "error": f"Erreur SSH: {exception}"}), 500
+
+
+@app.route("/api/edge/assignments")
+@login_required
+def api_edge_assignments():
+    """Registre des identites Edge affectees, pour eviter tout doublon."""
+    config = load_config()
+    return jsonify(
+        {
+            "assignments": config.get("edge_assignments", {}),
+            "keys_in_use": get_key_assignments(),
+            "master_keys": sorted(tb_edge.MASTER_ROUTING_KEYS),
+        }
+    )
 
 
 if __name__ == "__main__":

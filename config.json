@@ -2,303 +2,57 @@
   "users": {
     "admin-ip": {
       "password": "takieddine",
-      "email": "admin-ip@modberry.local"
-    },
-    "admin": {
-      "password": "admin123",
-      "email": "admin@modberry.local"
+      "email": "admin-ip@modberry.local",
+      "display_name": "Admin"
     }
   },
   "devices": [
     {
-      "ip": "192.168.5.52",
-      "hostname": "unknown",
+      "ip": "169.254.0.21",
+      "hostname": "sandbox.local",
       "serial": "unknown",
       "tb_edge": "not installed",
-      "subnet": "192.168.5.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.5.154",
-      "hostname": "unknown",
-      "serial": "error",
-      "tb_edge": "not installed",
-      "subnet": "192.168.5.0/24",
+      "subnet": "169.254.0.20/30",
       "online": true,
       "ssh": true,
       "kind": "ssh-device"
-    },
-    {
-      "ip": "192.168.14.133",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.14.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.0.1",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.0.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.0.203",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.0.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.0.253",
-      "hostname": "unknown",
-      "serial": "error",
-      "tb_edge": "not installed",
-      "subnet": "192.168.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "ssh-device"
-    },
-    {
-      "ip": "10.0.0.28",
-      "hostname": "techbase",
-      "serial": "9f8b54a9bb70f4cc\u0000",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "modberry"
-    },
-    {
-      "ip": "10.0.0.25",
-      "hostname": "techbase",
-      "serial": "bc75508a5e78699b\u0000",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "modberry"
-    },
-    {
-      "ip": "10.0.0.26",
-      "hostname": "techbase",
-      "serial": "9057cf1e146ee0b1\u0000",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "modberry"
-    },
-    {
-      "ip": "10.0.0.1",
-      "hostname": "unknown",
-      "serial": "error",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "ssh-device"
-    },
-    {
-      "ip": "10.0.0.151",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "10.0.0.101",
-      "hostname": "unknown",
-      "serial": "error",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "ssh-device"
-    },
-    {
-      "ip": "192.168.0.1",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.0.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.0.203",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.0.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.0.253",
-      "hostname": "unknown",
-      "serial": "error",
-      "tb_edge": "not installed",
-      "subnet": "192.168.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "ssh-device"
-    },
-    {
-      "ip": "192.168.5.52",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.5.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.5.154",
-      "hostname": "unknown",
-      "serial": "error",
-      "tb_edge": "not installed",
-      "subnet": "192.168.5.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "ssh-device"
-    },
-    {
-      "ip": "192.168.9.31",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.9.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.9.91",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.9.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.9.224",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.9.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.10.44",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.10.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.12.110",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.12.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
-    },
-    {
-      "ip": "192.168.14.133",
-      "hostname": "unknown",
-      "serial": "unknown",
-      "tb_edge": "not installed",
-      "subnet": "192.168.14.0/24",
-      "online": true,
-      "ssh": false,
-      "kind": "reachable"
     }
   ],
-  "modberries": [
-    {
-      "ip": "10.0.0.28",
-      "hostname": "techbase",
-      "serial": "9f8b54a9bb70f4cc\u0000",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "modberry"
-    },
-    {
-      "ip": "10.0.0.25",
-      "hostname": "techbase",
-      "serial": "bc75508a5e78699b\u0000",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "modberry"
-    },
-    {
-      "ip": "10.0.0.26",
-      "hostname": "techbase",
-      "serial": "9057cf1e146ee0b1\u0000",
-      "tb_edge": "not installed",
-      "subnet": "10.0.0.0/24",
-      "online": true,
-      "ssh": true,
-      "kind": "modberry"
-    }
-  ],
+  "modberries": [],
   "networks": [
+    "169.254.0.20/30",
+    "192.168.0.0/24",
+    "192.168.4.0/24",
+    "10.0.0.0/24",
     "192.168.5.0/24",
     "192.168.42.0/24",
     "192.168.14.0/24",
-    "192.168.0.0/24",
-    "10.0.0.0/24",
-    "192.168.1.0/24",
-    "192.168.4.0/24",
-    "192.168.0.0/20"
+    "192.168.1.0/24"
   ],
-  "last_scan": "2026-09-08T12:50:11.647485",
-  "edge_states": {},
+  "last_scan": "2026-09-08T14:35:25.347619",
   "edge_settings": {
-    "cloud_host": "",
-    "cloud_port": 7070,
+    "cloud_host": "10.0.0.1",
+    "cloud_port": 7071,
     "cloud_ssl": false,
     "cloud_web_url": "",
-    "edge_version": "4.0.0EDGE",
-    "edge_dir": "/opt/tb-edge",
-    "edge_http_port": 8080,
-    "edge_mqtt_port": 1883,
+    "master_ip": "10.0.0.26",
+    "edge_image": "thingsboard/tb-edge:4.3.1.3EDGE-mobilis",
+    "edge_dir": "/root/tb-edge-mobilis",
+    "compose_project": "tbedge-mobilis",
+    "edge_http_port": 8082,
+    "edge_mqtt_port": 1884,
+    "docker_data_root": "",
     "hostname_prefix": "modberry",
     "install_docker": true,
     "reset_data": true,
     "set_hostname": true,
     "pull_images": true,
-    "start_edge": true
-  }
+    "start_edge": true,
+    "transfer_image": true,
+    "transfer_gateway": true,
+    "install_gateway_service": true,
+    "enable_gateway_service": false
+  },
+  "edge_states": {},
+  "edge_assignments": {}
 }

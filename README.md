@@ -1,148 +1,196 @@
 # ModBerry Manager
 
 Interface web de gestion de parc **ModBerry X-500 CM5** : découverte LAN, changement d'IP,
-et **déploiement de ThingsBoard Edge** sur chaque carte depuis le navigateur.
+et **provisioning de ThingsBoard Edge** sur chaque carte depuis le navigateur.
 
 - URL : `http://<ip-du-serveur>:2310`
 - Identifiant par défaut : `admin-ip@modberry.local` / `takieddine`
 
----
-
-## Objectif : déployer ThingsBoard Edge sur plusieurs cartes
-
-La stratégie visée est le déploiement en masse à partir d'une image maître :
-
-```
-Master ModBerry CM5 (10.0.0.26)
-  └─ Docker + ThingsBoard Edge configuré depuis cette interface
-       └─ Création d'une Master Image (dd / rpi-clone)
-            └─ Flash en masse sur les autres CM5
-                 └─ First-Boot Provisioning  → identité unique par carte
-                      └─ Enregistrement automatique dans le Tenant ThingsBoard
-```
-
-Cette interface couvre le cycle complet : scan du LAN → détection de l'état de l'Edge →
-création de l'Edge côté serveur si absent → provisioning de la carte avec sa propre
-paire **Clé / Secret**.
+Cet outil automatise la procédure de réplication décrite dans le rapport de provisioning :
+transfert de la stack applicative depuis la carte de référence, génération d'une identité
+Edge unique par carte, et supervision — l'objectif étant le déploiement sur 99+ cartes.
 
 ---
 
-## Étape 1 — Découverte et état de l'Edge
+## Architecture de référence
 
-Le scan LAN (`Scanner maintenant`) détecte les hôtes joignables et identifie les ModBerry
-(hostname `techbase` / `modberry`, ou serial CM5 lisible).
+Carte maître **techbase** (`10.0.0.26`), pleinement fonctionnelle :
 
-La colonne **ThingsBoard Edge** du dashboard indique l'état de chaque carte :
+| Élément | Valeur |
+|---|---|
+| OS | Debian 12 bookworm, aarch64 |
+| Matériel | Raspberry Pi Compute Module 5 Rev 1.0 |
+| Docker | Docker CE (dépôt `download.docker.com`) |
+| Projet compose | `tbedge-mobilis` dans `/root/tb-edge-mobilis` |
+| Image Edge | `thingsboard/tb-edge:4.3.1.3EDGE-mobilis` (**custom**, ~2,4 Go) |
+| Base | `postgres:16`, non exposée sur l'hôte |
+| Ports hôte | HTTP `8082` → 8080, MQTT `1884` → 1883, CoAP `5683-5688/udp` |
+| Serveur ThingsBoard | `10.0.0.1`, port RPC **`7071`** |
+| Gateway I/O | `/opt/mobilis-gateway` + `tb-edge-io.service` (natif, hors Docker) |
+
+Ces valeurs sont les **défauts** de l'interface — inutile de les ressaisir.
+
+> Le port MQTT hôte est `1884` car `1883` est déjà occupé par le broker mosquitto
+> de la stack ChirpStack présente sur la carte maître. Le port RPC est `7071`, pas 7070.
+
+---
+
+## Deux contraintes structurantes
+
+### L'image Edge est customisée
+
+Le tag `4.3.1.3EDGE-mobilis` n'existe dans aucun registre public : un `docker pull` sur une
+carte neuve échoue. L'image doit être transférée depuis la carte maître par
+`docker save` → `docker load`. L'interface le fait automatiquement (§ Étape 1).
+
+### Les données ne doivent jamais être répliquées
+
+Le clonage disque complet (`dd`) a été **abandonné** : il duplique la base PostgreSQL de
+l'Edge, donc son identité et son historique. Deux Edges partageant la même base entrent en
+conflit direct sur le serveur (mêmes UUIDs internes).
+
+L'outil ne réplique donc que la **configuration** ; les volumes de données sont recréés
+vides sur chaque carte. Un garde-fou refuse en `409` toute tentative de réutiliser :
+
+- la routing key de la carte maître (`b534512b-…`)
+- une routing key déjà affectée à une autre carte du parc
+
+---
+
+## Étape 0 — Découverte et état
+
+Le scan LAN (`Scanner maintenant`) détecte les hôtes joignables et identifie les ModBerry.
+La colonne **ThingsBoard Edge** du dashboard donne l'état de chaque carte :
 
 | Badge | Signification |
 |---|---|
-| `Connecte au serveur` | Le conteneur tourne **et** les logs confirment la liaison au serveur |
-| `Demarrage / non connecte` | Conteneur démarré, liaison pas encore établie (ou clé refusée) |
-| `Edge arrete` | Stack présente mais conteneur arrêté |
-| `Non configure` | Docker présent, aucun `.env` Edge |
-| `Docker absent` | Docker n'est pas installé sur la carte |
+| `Connecte au serveur` | Conteneur actif **et** logs confirmant la liaison |
+| `Demarrage / non connecte` | Conteneur démarré, liaison pas établie (ou clé refusée) |
+| `Edge arrete` | Stack présente, conteneur arrêté |
+| `Non configure` | Docker et image présents, pas de `.env` |
+| `Image edge absente` | Docker présent, image custom manquante → réplication requise |
+| `Docker absent` | Docker CE non installé |
 | `Injoignable` | SSH indisponible |
 
-Bouton **Configurer Edge** → page dédiée `/edge/<ip>`.
+Bouton **Configurer Edge** → page `/edge/<ip>`. Une carte absente du dernier scan reste
+accessible en saisie directe par son IP (utile pour une carte neuve).
 
-### Ce que la sonde vérifie réellement (via SSH)
+### Ce que la sonde vérifie (via SSH)
 
-- version de Docker, disponibilité de `docker compose`, service `docker` actif
-- présence et contenu de `/opt/tb-edge/.env` (clé Edge, serveur cible, version)
-- état des conteneurs `tb-edge` et `tb-edge-postgres`
-- logs `tb-edge` filtrés pour détecter `connected to cloud`, `UNAUTHORIZED`,
-  `Failed to establish`, etc. → c'est ce qui distingue « démarré » de « réellement connecté »
-
----
-
-## Étape 2 — Créer l'Edge côté serveur (si la carte n'en a pas)
-
-Sur la page `/edge/<ip>`, section **1. Serveur ThingsBoard** :
-
-1. Renseignez l'URL du serveur (ex. `http://10.0.0.1:8080`) et vos identifiants **tenant**.
-   Ces identifiants servent uniquement à l'appel en cours, ils ne sont jamais stockés.
-2. Trois actions :
-   - **Lister les Edges du tenant** — voir tous les Edges existants et lesquels sont actifs
-   - **Verifier la Cle saisie** — savoir si une Clé donnée correspond à un Edge existant
-   - **Creer un nouvel Edge** — crée l'Edge dans le tenant et **récupère automatiquement
-     sa Clé et son Secret**, reportés directement dans le formulaire de déploiement
-
-Le nom proposé par défaut est dérivé du serial de la carte (ex. `modberry-146ee0b1`),
-ce qui garantit l'unicité dans le tenant.
-
-> Le bouton **Utiliser** de chaque ligne recopie la Clé/Secret d'un Edge existant
-> vers le formulaire de déploiement.
+OS et modèle · version Docker · **emplacement du stockage Docker** · **présence de l'image
+custom** · conteneurs `tb-edge` / `tb-edge-postgres` · contenu de `.env` · logs `tb-edge`
+(`connected to cloud`, `UNAUTHORIZED`, `Failed to establish`) · état de `tb-edge-io.service`
+· **comptage des erreurs GPIO** dans `/var/log/mobilis-gateway.log`.
 
 ---
 
-## Étape 3 — Provisionner la carte
+## Étape 1 — Carte de référence
 
-Section **2. Identifiants Edge et deploiement** :
+Section **1. Carte de reference** : bouton **Inventorier** → liste les images `tb-edge`
+disponibles sur la carte maître avec leur taille, l'état du compose et de la gateway.
+
+Le transfert d'image (`docker save | gzip` → SFTP → `docker load`) est déclenché
+automatiquement au déploiement si l'image manque sur la cible. Progression affichée en
+direct ; comptez plusieurs dizaines de minutes pour ~2,4 Go.
+
+---
+
+## Étape 2 — Identité Edge dans le tenant
+
+Section **2. Serveur ThingsBoard** : renseignez l'URL et vos identifiants **tenant**
+(utilisés pour l'appel en cours uniquement, jamais stockés), puis :
+
+- **Lister les Edges du tenant** — voir les Edges existants et lesquels sont actifs
+- **Verifier la Cle saisie** — savoir si une Clé correspond à un Edge existant
+- **Creer un nouvel Edge** — crée l'Edge et **récupère automatiquement sa Clé et son
+  Secret**, reportés dans le formulaire de déploiement
+
+Le nom proposé est dérivé du serial de la carte, garantissant l'unicité dans le tenant.
+Cela remplace la création manuelle via l'interface web, non tenable sur 99+ cartes.
+
+> En cas d'erreur `Invalid username or password`, vérifiez les identifiants tenant du
+> serveur `10.0.0.1` — c'est le blocage rencontré lors de la session manuelle.
+
+---
+
+## Étape 3 — Déploiement
 
 | Champ | Exemple |
 |---|---|
 | Clé Edge (cloud routing key) | `1666b31c-e954-04e6-a19d-01adbeaa6eae` |
 | Secret Edge (cloud routing secret) | `yxsjali73u4ypuktq4fb` |
 | Hôte du serveur ThingsBoard | `10.0.0.1` |
-| Port RPC edge | `7070` |
+| Port RPC edge | `7071` |
 
-La Clé est validée comme UUID et le Secret comme chaîne alphanumérique (8–64 car.)
-avant tout envoi sur la carte.
+Le déploiement enchaîne trois étapes dans une seule action, avec journal en direct :
 
-**Options avancées** : version de l'image `tb-edge`, répertoire d'installation, ports
-HTTP/MQTT locaux, mot de passe Postgres, et les bascules :
+1. **Image Docker custom** — `docker save` sur le maître → `docker load` sur la cible
+   (ignoré si l'image est déjà présente)
+2. **Stack** — installation de Docker CE si absent, écriture de `.env` (chmod 600) et
+   `docker-compose.yml`, récupération de `postgres:16`, `docker compose up -d`
+3. **Gateway I/O** — copie de `/opt/mobilis-gateway`, installation de `tb-edge-io.service`
 
-- **Purger la base locale** — efface `/var/lib/tb-edge/db`. **Indispensable après clonage
-  d'une Master Image** : sans cela la carte réutilise l'identité Edge de la carte maître.
-- **Definir un hostname unique depuis le serial** — `modberry-<8 derniers car. du serial>`
-- **Installer Docker si absent** — installe Docker via `get.docker.com`
-- **Telecharger les images Docker** / **Demarrer l'Edge a la fin**
+À la fin, une sonde automatique met l'état à jour.
 
-Le déploiement s'exécute en tâche de fond ; le **Journal** affiche la sortie du script
-en direct (polling incrémental), y compris le `docker compose pull` qui peut durer
-plusieurs minutes sur ARM64.
+### Options avancées
 
-À la fin, une sonde automatique est relancée et l'état est mis à jour.
+Répertoire, projet compose, ports hôte, mot de passe Postgres, **stockage Docker sur SSD**
+(`/mnt/ssd/docker`, comme sur la carte maître), et les bascules :
 
-### Ce que le provisioning écrit sur la carte
+- **Purger les volumes de donnees** — `docker compose down -v` + suppression des volumes.
+  **Indispensable** sur une carte issue d'une image clonée.
+- **Hostname unique derive du serial** — `modberry-<8 derniers car. du serial CM5>`
+- **Installer Docker CE si absent** — dépôt officiel Debian, arch. détectée (arm64)
+- **Transferer la gateway I/O** / **Installer l'unite tb-edge-io.service**
+- **Demarrer la gateway** — **décoché par défaut**, voir ci-dessous
 
-```
-/opt/tb-edge/.env                 identité unique (clé, secret, serveur) — chmod 600
-/opt/tb-edge/docker-compose.yml   stack tb-edge + postgres 16
-/var/lib/tb-edge/db               données Postgres
-/var/lib/tb-edge/logs             logs tb-edge
-```
+### Installation Docker CE
 
-Le script est **idempotent** : il arrête la stack existante, réécrit la configuration,
-puis redémarre. Il peut être relancé sans risque.
-
----
-
-## Étape 4 — Master Image et déploiement en masse
-
-1. Configurez et validez **une** carte maître (ici `10.0.0.26`) jusqu'au badge
-   `Connecte au serveur`.
-2. Arrêtez la stack (`Arreter`) et créez l'image disque de la carte.
-3. Flashez l'image sur les autres CM5.
-4. Pour chaque nouvelle carte : scan → **Configurer Edge** → créer son Edge dans le tenant
-   → déployer avec **Purger la base locale** et **hostname unique** cochés.
-
-Chaque carte obtient ainsi sa propre identité et s'enregistre séparément dans le tenant.
-
-> Le script `assets/edge_provision.sh` est autonome : il peut aussi être appelé par un
-> service systemd `first-boot` sur l'image clonée, avec les variables d'environnement
-> `EDGE_KEY`, `EDGE_SECRET`, `CLOUD_RPC_HOST`, `RESET_DATA=1`, `SET_HOSTNAME=1`.
+Reproduit exactement la procédure de la carte maître : `ca-certificates curl gnupg`, clé
+GPG dans `/etc/apt/keyrings/docker.asc`, dépôt
+`deb [arch=arm64 signed-by=…] …/debian bookworm stable`, puis `docker-ce docker-ce-cli
+containerd.io docker-buildx-plugin docker-compose-plugin`.
 
 ---
 
-## Supervision
+## Bug GPIO de la gateway — non corrigé
 
-Depuis la page `/edge/<ip>` :
+La gateway génère des erreurs répétées `Device or resource busy` et
+`This port is not configure yet`, vraisemblablement un conflit d'ouverture de port GPIO
+dans `edge_gateway.py`.
 
-- **Verifier maintenant** — relance la sonde SSH
-- **Demarrer / Redemarrer / Arreter** — pilote la stack docker compose
-- **Voir les logs** — 200 dernières lignes du conteneur `tb-edge`
-- Lien vers l'interface Edge locale `http://<ip>:8080`
+En conséquence :
+
+- le service est **installé mais pas démarré** par défaut après transfert
+- la sonde **compte ces erreurs** et la page affiche un avertissement dédié
+- ce bug doit être corrigé **avant** toute containerisation de la gateway
+  (ne pas le masquer avec `privileged: true`)
+
+Boutons dédiés sur la page : démarrer / redémarrer / arrêter la gateway et consulter ses logs.
+
+---
+
+## Déploiement en masse
+
+1. Validez la carte maître jusqu'au badge `Connecte au serveur`.
+2. Préparez une image système **avec Docker CE pré-installé mais sans identité Edge**
+   (pas de `.env`, pas de volumes de données), puis flashez-la sur les autres CM5.
+3. Pour chaque carte : **Configurer Edge** → créer son Edge dans le tenant → déployer
+   avec **Purger les volumes** et **Hostname unique** cochés.
+
+Le registre `/api/edge/assignments` liste les identités déjà affectées et empêche tout doublon.
+
+> `assets/edge_provision.sh` est autonome et idempotent : il peut servir de service
+> systemd `first-boot` sur l'image clonée, via `EDGE_KEY`, `EDGE_SECRET`,
+> `CLOUD_RPC_HOST`, `RESET_DATA=1`, `SET_HOSTNAME=1`.
+
+---
+
+## Ce qui n'est pas géré
+
+- La stack **ChirpStack** de la carte maître (chirpstack, gateway-bridge, mosquitto,
+  postgres:14, redis:7) n'est pas répliquée — hors périmètre.
+- La **containerisation de la gateway** est reportée jusqu'à correction du bug GPIO.
 
 ---
 
@@ -150,15 +198,21 @@ Depuis la page `/edge/<ip>` :
 
 | Méthode | Route | Rôle |
 |---|---|---|
-| `GET/POST` | `/api/edge/<ip>/probe` | État complet de l'Edge sur la carte |
-| `POST` | `/api/edge/<ip>/deploy` | Lance le provisioning (tâche de fond) |
-| `GET` | `/api/edge/<ip>/job?offset=N` | Logs incrémentaux du déploiement |
+| `GET/POST` | `/api/edge/<ip>/probe` | État complet de l'Edge |
+| `POST` | `/api/edge/<ip>/deploy` | Séquence image → stack → gateway |
+| `GET` | `/api/edge/<ip>/job?offset=N` | Logs incrémentaux |
 | `POST` | `/api/edge/<ip>/control` | `start` / `stop` / `restart` / `down` |
-| `GET` | `/api/edge/<ip>/logs?lines=200` | Logs du conteneur `tb-edge` |
-| `GET/POST` | `/api/edge/settings` | Réglages Edge globaux |
-| `GET` | `/api/edge/states` | Derniers états connus, par IP |
+| `GET` | `/api/edge/<ip>/logs` | Logs du conteneur `tb-edge` |
+| `GET/POST` | `/api/master/inspect` | Inventaire de la carte de référence |
+| `GET` | `/api/edge/<ip>/gateway` | État de la gateway I/O |
+| `POST` | `/api/edge/<ip>/gateway/transfer` | Transfert de la gateway seule |
+| `POST` | `/api/edge/<ip>/gateway/control` | `start`/`stop`/`restart`/`enable`/`status` |
+| `GET` | `/api/edge/<ip>/gateway/logs` | Logs de la gateway |
+| `GET` | `/api/edge/assignments` | Registre des identités affectées |
+| `GET/POST` | `/api/edge/settings` | Réglages globaux |
+| `GET` | `/api/edge/states` | Derniers états connus |
 | `POST` | `/api/tb/edges` | Liste les Edges du tenant |
-| `POST` | `/api/tb/edge/lookup` | Cherche un Edge par clé ou par nom |
+| `POST` | `/api/tb/edge/lookup` | Recherche par clé ou nom |
 | `POST` | `/api/tb/edge/create` | Crée un Edge, renvoie clé + secret |
 | `GET` | `/api/devices`, `/api/modberries`, `/api/networks` | Inventaire du scan |
 | `POST` | `/scan` | Déclenche un scan réseau |
@@ -187,8 +241,9 @@ journalctl -u modberry_manager.service -f
 | `MODBERRY_SECRET_KEY` | — | Clé de session Flask (**à définir en production**) |
 | `MODBERRY_SSH_USER` | `root` | Utilisateur SSH des cartes |
 | `MODBERRY_SSH_PASSWORD` | `techbase` | Mot de passe SSH des cartes |
-| `MODBERRY_TB_HOST` | — | Hôte ThingsBoard par défaut |
-| `MODBERRY_TB_RPC_PORT` | `7070` | Port RPC edge par défaut |
+| `MODBERRY_MASTER_IP` | `10.0.0.26` | Carte de référence |
+| `MODBERRY_TB_HOST` | `10.0.0.1` | Serveur ThingsBoard |
+| `MODBERRY_TB_RPC_PORT` | `7071` | Port RPC edge |
 | `MODBERRY_TB_URL` | — | URL web du serveur ThingsBoard |
 | `MODBERRY_AUTO_SCAN_INTERVAL_SECONDS` | `7200` | Intervalle du scan automatique |
 
@@ -197,18 +252,20 @@ journalctl -u modberry_manager.service -f
 ## Structure
 
 ```
-app.py                      application Flask + routes Edge
-tb_edge.py                  sonde SSH et provisioning des cartes
+app.py                      application Flask + routes Edge / master / gateway
+tb_edge.py                  sonde SSH, provisioning, garde-fou d'identité
+tb_master.py                réplication depuis la carte de référence
 tb_cloud.py                 client REST du serveur ThingsBoard (tenant)
 jobs.py                     tâches de fond avec logs incrémentaux
 assets/edge_provision.sh    script exécuté sur la carte (idempotent, first-boot)
-templates/edge.html         page de configuration ThingsBoard Edge
+templates/edge.html         page de provisioning en 3 étapes
 templates/dashboard.html    inventaire + colonne d'état Edge
-config.json                 état persisté (scan, réglages, états Edge)
+config.json                 état persisté (scan, réglages, états, identités)
 ```
 
 ## Prérequis sur les cartes
 
 - SSH accessible avec les identifiants configurés
 - `sudo` sans mot de passe si l'utilisateur SSH n'est pas `root`
-- accès réseau au serveur ThingsBoard sur le port RPC (7070) et à Docker Hub pour le `pull`
+- accès réseau au serveur ThingsBoard (port RPC `7071`)
+- accès à Docker Hub pour `postgres:16` (l'image Edge, elle, vient de la carte maître)

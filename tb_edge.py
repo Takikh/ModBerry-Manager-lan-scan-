@@ -22,10 +22,23 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROVISION_SCRIPT = os.path.join(BASE_DIR, "assets", "edge_provision.sh")
 REMOTE_SCRIPT = "/tmp/modberry_edge_provision.sh"
 
-DEFAULT_EDGE_DIR = "/opt/tb-edge"
-DEFAULT_EDGE_HTTP_PORT = 8080
-DEFAULT_EDGE_VERSION = "4.0.0EDGE"
-DEFAULT_CLOUD_RPC_PORT = 7070
+# Valeurs alignees sur la carte de reference "techbase" (10.0.0.26).
+# Voir README - Architecture de reference.
+DEFAULT_EDGE_DIR = "/root/tb-edge-mobilis"
+DEFAULT_EDGE_HTTP_PORT = 8082          # 8082 -> 8080 dans le conteneur
+DEFAULT_EDGE_MQTT_PORT = 1884          # 1884 -> 1883 (1883 est pris par mosquitto)
+DEFAULT_EDGE_IMAGE = "thingsboard/tb-edge:4.3.1.3EDGE-mobilis"
+DEFAULT_CLOUD_RPC_PORT = 7071
+DEFAULT_COMPOSE_PROJECT = "tbedge-mobilis"
+DEFAULT_DOCKER_DATA_ROOT = "/mnt/ssd/docker"
+
+# Gateway I/O Python (VTEKE / Modbus / GPIO), executee nativement en systemd
+GATEWAY_DIR = "/opt/mobilis-gateway"
+GATEWAY_SERVICE = "tb-edge-io.service"
+GATEWAY_LOG = "/var/log/mobilis-gateway.log"
+
+# Conserve pour compatibilite avec l'ancien nommage
+DEFAULT_EDGE_VERSION = DEFAULT_EDGE_IMAGE
 
 SSH_CONNECT_TIMEOUT = 8
 EXEC_TIMEOUT = 25
@@ -53,6 +66,42 @@ def validate_edge_secret(value):
     if not re.match(r"^[A-Za-z0-9]{8,64}$", value):
         return False, "Le Secret Edge doit contenir 8 a 64 caracteres alphanumeriques."
     return True, value
+
+
+# Identite de la carte de reference : ne doit JAMAIS etre reutilisee ailleurs.
+# Deux Edge partageant la meme routing key entrent en conflit sur le serveur.
+MASTER_ROUTING_KEYS = {
+    "b534512b-9c61-ed18-0765-86e95dc799d1",  # techbase / 10.0.0.26
+}
+
+
+def check_key_not_reused(edge_key, target_ip, assignments):
+    """
+    Verifie qu'une routing key n'est pas deja affectee a une autre carte.
+
+    assignments : {routing_key: ip} des cles deja deployees.
+    Retour : (ok, message)
+    """
+    key = (edge_key or "").strip().lower()
+    if not key:
+        return True, ""
+
+    if key in {item.lower() for item in MASTER_ROUTING_KEYS}:
+        return False, (
+            "Cette Cle Edge est celle de la carte de reference (techbase). "
+            "Chaque carte doit avoir sa propre paire Cle/Secret : creez un nouvel "
+            "Edge dans ThingsBoard pour cette carte."
+        )
+
+    for assigned_key, assigned_ip in (assignments or {}).items():
+        if assigned_key.lower() == key and str(assigned_ip) != str(target_ip):
+            return False, (
+                f"Cette Cle Edge est deja utilisee par la carte {assigned_ip}. "
+                "Reutiliser une meme cle provoque un conflit d'identite sur le serveur "
+                "ThingsBoard : creez un Edge distinct pour cette carte."
+            )
+
+    return True, ""
 
 
 def validate_host(value):
@@ -219,12 +268,31 @@ def probe_edge(ip, user, password, edge_dir=DEFAULT_EDGE_DIR, port=22):
         "cloud_hint": None,
         "edge_url": None,
         "status": "unknown",
+        # specifiques au parc ModBerry
+        "os_pretty": None,
+        "model": None,
+        "arch": None,
+        "edge_image": None,
+        "image_present": False,
+        "docker_data_root": None,
+        "compose_project": None,
+        "gateway_present": False,
+        "gateway_service_state": None,
+        "gateway_gpio_errors": 0,
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
     try:
         with SSHSession(ip, user, password, port=port) as ssh:
             state["reachable"] = True
+
+            state["os_pretty"] = ssh.out(
+                ". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\""
+            ) or None
+            state["model"] = ssh.out(
+                "tr -d '\\000' < /proc/device-tree/model 2>/dev/null"
+            ) or None
+            state["arch"] = ssh.out("uname -m 2>/dev/null") or None
 
             docker_version = ssh.out("docker --version 2>/dev/null")
             if docker_version and "Docker version" in docker_version:
@@ -240,6 +308,9 @@ def probe_edge(ip, user, password, edge_dir=DEFAULT_EDGE_DIR, port=22):
                 state["docker_running"] = "active" in ssh.out(
                     "systemctl is-active docker 2>/dev/null || echo unknown"
                 )
+                state["docker_data_root"] = ssh.out(
+                    "docker info -f '{{.DockerRootDir}}' 2>/dev/null"
+                ) or None
 
             env_text = ssh.out(
                 f"cat {shlex.quote(edge_dir)}/.env 2>/dev/null "
@@ -253,13 +324,26 @@ def probe_edge(ip, user, password, edge_dir=DEFAULT_EDGE_DIR, port=22):
                 state["board_serial"] = env.get("BOARD_SERIAL")
                 state["cloud_host"] = env.get("CLOUD_RPC_HOST")
                 state["cloud_port"] = env.get("CLOUD_RPC_PORT")
-                state["edge_version"] = env.get("EDGE_VERSION")
+                state["compose_project"] = env.get("COMPOSE_PROJECT_NAME")
+                state["edge_image"] = env.get("EDGE_IMAGE") or env.get("EDGE_VERSION")
+                state["edge_version"] = state["edge_image"]
                 try:
                     state["edge_http_port"] = int(env.get("EDGE_HTTP_PORT") or DEFAULT_EDGE_HTTP_PORT)
                 except ValueError:
                     pass
 
             if state["docker_installed"]:
+                # L'image edge porte un tag custom, absent des registres publics :
+                # sa presence locale conditionne tout demarrage.
+                wanted_image = state["edge_image"] or DEFAULT_EDGE_IMAGE
+                image_id = ssh.out(
+                    f"docker image inspect {shlex.quote(wanted_image)} "
+                    "--format '{{.Id}}' 2>/dev/null || true"
+                )
+                state["image_present"] = bool(image_id)
+                if not state["edge_image"]:
+                    state["edge_image"] = wanted_image if image_id else None
+
                 ps_line = ssh.out(
                     "docker ps -a --filter name=^/tb-edge$ --format '{{.State}}|{{.Status}}' 2>/dev/null"
                 )
@@ -290,6 +374,28 @@ def probe_edge(ip, user, password, edge_dir=DEFAULT_EDGE_DIR, port=22):
                 else:
                     state["cloud_hint"] = _last_meaningful_line(logs) or "Demarrage en cours..."
 
+            # Gateway I/O Python (executee nativement en systemd)
+            gateway_files = ssh.out(
+                f"ls -1 {shlex.quote(GATEWAY_DIR)} 2>/dev/null | wc -l || echo 0"
+            )
+            try:
+                state["gateway_present"] = int((gateway_files or "0").strip()) > 0
+            except ValueError:
+                state["gateway_present"] = False
+
+            if state["gateway_present"]:
+                state["gateway_service_state"] = ssh.out(
+                    f"systemctl is-active {shlex.quote(GATEWAY_SERVICE)} 2>/dev/null || echo absent"
+                )
+                gpio_errors = ssh.out(
+                    f"grep -Ec 'Device or resource busy|not configure yet' "
+                    f"{shlex.quote(GATEWAY_LOG)} 2>/dev/null || echo 0"
+                )
+                try:
+                    state["gateway_gpio_errors"] = int((gpio_errors or "0").strip())
+                except ValueError:
+                    state["gateway_gpio_errors"] = 0
+
             state["edge_url"] = f"http://{state['ip']}:{state['edge_http_port']}"
             state["status"] = _derive_status(state)
 
@@ -312,7 +418,9 @@ def _derive_status(state):
     if not state["docker_installed"]:
         return "not_installed"
     if not state["configured"] and state["container_state"] == "absent":
-        return "not_configured"
+        # Docker present mais image custom absente : la replication depuis la
+        # carte de reference est necessaire avant tout provisioning.
+        return "image_missing" if not state["image_present"] else "not_configured"
     if state["container_state"] == "running":
         return "connected" if state["cloud_connected"] else "starting"
     if state["container_state"] in {"exited", "created", "paused", "restarting", "dead"}:
@@ -324,6 +432,7 @@ def _derive_status(state):
 
 STATUS_LABELS = {
     "not_installed": ("Docker absent", "badge-warning"),
+    "image_missing": ("Image edge absente", "badge-warning"),
     "not_configured": ("Edge non configure", "badge-warning"),
     "stopped": ("Edge arrete", "badge-danger"),
     "starting": ("Demarrage / non connecte", "badge-info"),
@@ -371,10 +480,11 @@ def deploy_edge(ip, user, password, options, on_line, port=22):
         "CLOUD_RPC_HOST": cloud_host,
         "CLOUD_RPC_PORT": str(options.get("cloud_port") or DEFAULT_CLOUD_RPC_PORT),
         "CLOUD_RPC_SSL": "true" if options.get("cloud_ssl") else "false",
-        "EDGE_VERSION": options.get("edge_version") or DEFAULT_EDGE_VERSION,
+        "EDGE_IMAGE": options.get("edge_image") or options.get("edge_version") or DEFAULT_EDGE_IMAGE,
         "EDGE_DIR": edge_dir,
+        "COMPOSE_PROJECT": options.get("compose_project") or DEFAULT_COMPOSE_PROJECT,
         "EDGE_HTTP_PORT": str(options.get("edge_http_port") or DEFAULT_EDGE_HTTP_PORT),
-        "EDGE_MQTT_PORT": str(options.get("edge_mqtt_port") or 1883),
+        "EDGE_MQTT_PORT": str(options.get("edge_mqtt_port") or DEFAULT_EDGE_MQTT_PORT),
         "PG_PASSWORD": options.get("pg_password") or "postgres",
         "RESET_DATA": "1" if options.get("reset_data", True) else "0",
         "SET_HOSTNAME": "1" if options.get("set_hostname") else "0",
@@ -385,6 +495,8 @@ def deploy_edge(ip, user, password, options, on_line, port=22):
     }
     if options.get("edge_name"):
         env_pairs["EDGE_NAME"] = options["edge_name"]
+    if options.get("docker_data_root"):
+        env_pairs["DOCKER_DATA_ROOT"] = options["docker_data_root"]
 
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env_pairs.items())
 
@@ -420,16 +532,26 @@ CONTROL_COMMANDS = {
 }
 
 
-def control_edge(ip, user, password, action, edge_dir=DEFAULT_EDGE_DIR, port=22):
+def control_edge(
+    ip,
+    user,
+    password,
+    action,
+    edge_dir=DEFAULT_EDGE_DIR,
+    compose_project=DEFAULT_COMPOSE_PROJECT,
+    port=22,
+):
     """start | stop | restart | down la stack docker de l'Edge."""
     if action not in CONTROL_COMMANDS:
         return False, f"Action inconnue: {action}"
 
     sudo = "" if user == "root" else "sudo -n "
     subcommand = CONTROL_COMMANDS[action]
+    project = f"-p {shlex.quote(compose_project)} " if compose_project else ""
     command = (
         f"cd {shlex.quote(edge_dir)} && "
-        f"({sudo}docker compose {subcommand} || {sudo}docker-compose {subcommand}) 2>&1"
+        f"({sudo}docker compose {project}{subcommand} "
+        f"|| {sudo}docker-compose {project}{subcommand}) 2>&1"
     )
     try:
         with SSHSession(ip, user, password, port=port) as ssh:
