@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ThingsBoard Edge - {{ device.ip }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-ip="{{ device.ip }}">
+<div class="container">
+
+    <div class="header dashboard-header">
+        <div>
+            <div class="eyebrow">ThingsBoard Edge</div>
+            <h1>{{ device.ip }}</h1>
+            <p class="subtitle">
+                {{ device.hostname or 'unknown' }}
+                &middot; serial <code>{{ (device.serial or 'unknown')|replace('\u0000','') }}</code>
+                &middot; reseau <code>{{ device.subnet }}</code>
+            </p>
+        </div>
+        <div class="user-info">
+            <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Retour au dashboard</a>
+        </div>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            <div class="flash-messages">
+                {% for category, message in messages %}
+                    <div class="flash-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% endwith %}
+
+    <!-- ============================ ETAT ACTUEL ============================ -->
+    <div class="card">
+        <div class="card-header">
+            <div>
+                <h2>Etat de l'Edge sur la carte</h2>
+                <p class="section-note">Verification en direct via SSH : Docker, stack <code>tb-edge</code>, identite configuree et connexion au serveur.</p>
+            </div>
+            <button class="btn btn-primary" id="probeBtn" onclick="probeEdge()">Verifier maintenant</button>
+        </div>
+
+        <div class="system-grid" id="edgeStateGrid">
+            {% if state %}
+                {% set label, css = status_label(state.status) %}
+                <div class="system-item">Statut: <span class="badge {{ css }}" id="edgeStatusBadge">{{ label }}</span></div>
+                <div class="system-item">Docker: <strong id="edgeDocker">{{ state.docker_version or 'absent' }}</strong></div>
+                <div class="system-item">Conteneur: <strong id="edgeContainer">{{ state.container_status or state.container_state }}</strong></div>
+                <div class="system-item">Postgres: <strong id="edgePostgres">{{ state.postgres_status or 'absent' }}</strong></div>
+                <div class="system-item">Cle Edge: <code id="edgeKeyState">{{ state.edge_key or 'non configuree' }}</code></div>
+                <div class="system-item">Serveur: <strong id="edgeCloud">{{ state.cloud_host or '-' }}:{{ state.cloud_port or '-' }}</strong></div>
+                <div class="system-item">Connexion serveur: <strong id="edgeConnected">{{ 'Oui' if state.cloud_connected else 'Non' }}</strong></div>
+                <div class="system-item">Interface locale:
+                    <strong id="edgeUrl">
+                        {% if state.edge_url %}<a href="{{ state.edge_url }}" target="_blank" rel="noopener">{{ state.edge_url }}</a>{% else %}-{% endif %}
+                    </strong>
+                </div>
+            {% else %}
+                <div class="system-item">Statut: <span class="badge badge-warning" id="edgeStatusBadge">Non verifie</span></div>
+                <div class="system-item">Docker: <strong id="edgeDocker">?</strong></div>
+                <div class="system-item">Conteneur: <strong id="edgeContainer">?</strong></div>
+                <div class="system-item">Postgres: <strong id="edgePostgres">?</strong></div>
+                <div class="system-item">Cle Edge: <code id="edgeKeyState">?</code></div>
+                <div class="system-item">Serveur: <strong id="edgeCloud">?</strong></div>
+                <div class="system-item">Connexion serveur: <strong id="edgeConnected">?</strong></div>
+                <div class="system-item">Interface locale: <strong id="edgeUrl">?</strong></div>
+            {% endif %}
+        </div>
+
+        <p class="small-muted" id="edgeHint">{{ state.cloud_hint if state and state.cloud_hint else 'Cliquez sur "Verifier maintenant" pour interroger la carte.' }}</p>
+
+        <div class="btn-group" style="margin-top:12px">
+            <button class="btn btn-secondary btn-sm" onclick="controlEdge('start')">Demarrer</button>
+            <button class="btn btn-secondary btn-sm" onclick="controlEdge('restart')">Redemarrer</button>
+            <button class="btn btn-warning btn-sm" onclick="controlEdge('stop')">Arreter</button>
+            <button class="btn btn-secondary btn-sm" onclick="loadLogs()">Voir les logs</button>
+        </div>
+    </div>
+
+    <!-- ================== SERVEUR THINGSBOARD (TENANT) ==================== -->
+    <div class="card">
+        <div class="card-header">
+            <div>
+                <h2>1. Serveur ThingsBoard (optionnel mais recommande)</h2>
+                <p class="section-note">
+                    Connectez-vous au tenant pour verifier si un Edge existe deja, ou pour le
+                    <strong>creer directement d'ici</strong> et recuperer automatiquement sa Cle et son Secret.
+                </p>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>URL du serveur ThingsBoard</label>
+                <input type="text" id="tb_url" value="{{ settings.cloud_web_url or ('http://' ~ settings.cloud_host ~ ':8080' if settings.cloud_host else '') }}" placeholder="http://10.0.0.1:8080">
+                <div class="help">Interface web du serveur (port 8080 par defaut)</div>
+            </div>
+            <div class="form-group">
+                <label>Utilisateur tenant</label>
+                <input type="text" id="tb_username" placeholder="tenant@thingsboard.org" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>Mot de passe tenant</label>
+                <input type="password" id="tb_password" placeholder="••••••••" autocomplete="new-password">
+                <div class="help">Utilise uniquement pour cet appel, jamais enregistre.</div>
+            </div>
+        </div>
+
+        <div class="btn-group">
+            <button class="btn btn-secondary" onclick="listEdges()">Lister les Edges du tenant</button>
+            <button class="btn btn-secondary" onclick="lookupEdge()">Verifier la Cle saisie</button>
+            <button class="btn btn-primary" onclick="createEdge()">Creer un nouvel Edge</button>
+        </div>
+
+        <div class="form-row" style="margin-top:12px">
+            <div class="form-group">
+                <label>Nom du nouvel Edge</label>
+                <input type="text" id="new_edge_name" value="modberry-{{ ((device.serial or '')|replace('\u0000',''))[-8:] or device.ip|replace('.','-') }}">
+                <div class="help">Doit etre unique dans le tenant</div>
+            </div>
+            <div class="form-group">
+                <label>Type</label>
+                <input type="text" id="new_edge_type" value="default">
+            </div>
+            <div class="form-group">
+                <label>Label</label>
+                <input type="text" id="new_edge_label" value="ModBerry {{ device.ip }}">
+            </div>
+        </div>
+
+        <div id="tbResult" class="tb-result"></div>
+    </div>
+
+    <!-- ================= PROVISIONING / IDENTITE EDGE ===================== -->
+    <div class="card">
+        <div class="card-header">
+            <div>
+                <h2>2. Identifiants Edge et deploiement</h2>
+                <p class="section-note">
+                    Renseignez la <strong>Cle Edge</strong> et le <strong>Secret Edge</strong> de cette carte, puis lancez le deploiement.
+                    Chaque carte doit avoir sa propre paire Cle/Secret.
+                </p>
+            </div>
+        </div>
+
+        <form id="deployForm" onsubmit="event.preventDefault(); deployEdge();">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Cle Edge (Cloud routing key) *</label>
+                    <input type="text" id="edge_key" name="edge_key"
+                           value="{{ state.edge_key if state and state.edge_key else '' }}"
+                           placeholder="1666b31c-e954-04e6-a19d-01adbeaa6eae"
+                           spellcheck="false" required>
+                    <div class="help">UUID fourni par ThingsBoard a la creation de l'Edge</div>
+                </div>
+                <div class="form-group">
+                    <label>Secret Edge (Cloud routing secret) *</label>
+                    <input type="text" id="edge_secret" name="edge_secret"
+                           placeholder="yxsjali73u4ypuktq4fb" spellcheck="false" required>
+                    <div class="help">20 caracteres alphanumeriques</div>
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Hote du serveur ThingsBoard *</label>
+                    <input type="text" id="cloud_host" value="{{ settings.cloud_host }}" placeholder="10.0.0.1" required>
+                    <div class="help">IP ou DNS joignable depuis la carte</div>
+                </div>
+                <div class="form-group">
+                    <label>Port RPC edge</label>
+                    <input type="number" id="cloud_port" value="{{ settings.cloud_port or 7070 }}">
+                    <div class="help">7070 par defaut</div>
+                </div>
+                <div class="form-group">
+                    <label>SSL vers le serveur</label>
+                    <select id="cloud_ssl">
+                        <option value="0" {{ '' if settings.cloud_ssl else 'selected' }}>Non</option>
+                        <option value="1" {{ 'selected' if settings.cloud_ssl else '' }}>Oui</option>
+                    </select>
+                </div>
+            </div>
+
+            <details class="advanced">
+                <summary>Options avancees</summary>
+                <div class="form-row" style="margin-top:12px">
+                    <div class="form-group">
+                        <label>Version de l'image tb-edge</label>
+                        <input type="text" id="edge_version" value="{{ settings.edge_version or default_edge_version }}">
+                    </div>
+                    <div class="form-group">
+                        <label>Repertoire d'installation</label>
+                        <input type="text" id="edge_dir" value="{{ settings.edge_dir }}">
+                    </div>
+                    <div class="form-group">
+                        <label>Port HTTP local</label>
+                        <input type="number" id="edge_http_port" value="{{ settings.edge_http_port or 8080 }}">
+                    </div>
+                    <div class="form-group">
+                        <label>Port MQTT local</label>
+                        <input type="number" id="edge_mqtt_port" value="{{ settings.edge_mqtt_port or 1883 }}">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Nom Edge (informatif)</label>
+                        <input type="text" id="edge_name" placeholder="modberry-xxxxx">
+                    </div>
+                    <div class="form-group">
+                        <label>Prefixe hostname</label>
+                        <input type="text" id="hostname_prefix" value="{{ settings.hostname_prefix or 'modberry' }}">
+                    </div>
+                    <div class="form-group">
+                        <label>Mot de passe Postgres local</label>
+                        <input type="text" id="pg_password" value="postgres">
+                    </div>
+                </div>
+                <div class="checkbox-grid">
+                    <label class="checkbox"><input type="checkbox" id="reset_data" checked> Purger la base locale (obligatoire sur une image clonee)</label>
+                    <label class="checkbox"><input type="checkbox" id="set_hostname" {{ 'checked' if settings.set_hostname else '' }}> Definir un hostname unique depuis le serial</label>
+                    <label class="checkbox"><input type="checkbox" id="install_docker" {{ 'checked' if settings.install_docker else '' }}> Installer Docker si absent</label>
+                    <label class="checkbox"><input type="checkbox" id="pull_images" checked> Telecharger les images Docker</label>
+                    <label class="checkbox"><input type="checkbox" id="start_edge" checked> Demarrer l'Edge a la fin</label>
+                </div>
+            </details>
+
+            <div class="warning" style="margin-top:14px">
+                <strong>Important :</strong> le deploiement arrete la stack existante, reecrit
+                <code>{{ settings.edge_dir }}/.env</code> et <code>docker-compose.yml</code>, puis redemarre l'Edge.
+                Avec « Purger la base locale » coche, l'historique local de l'Edge est efface (indispensable apres clonage d'une Master Image).
+            </div>
+
+            <div class="btn-group">
+                <button type="submit" class="btn btn-primary" id="deployBtn">Deployer / Reconfigurer l'Edge</button>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Annuler</a>
+            </div>
+        </form>
+    </div>
+
+    <!-- ============================== LOGS ================================= -->
+    <div class="card" id="logCard">
+        <div class="card-header">
+            <div>
+                <h2>Journal</h2>
+                <p class="section-note">Sortie du provisioning et logs du conteneur.</p>
+            </div>
+            <span class="badge badge-info" id="jobBadge">inactif</span>
+        </div>
+        <pre class="console" id="console">{% if job %}{{ job.lines|join('\n') }}{% else %}Aucune operation en cours.{% endif %}</pre>
+    </div>
+
+</div>
+
+<script>
+const IP = document.body.dataset.ip;
+let jobOffset = 0;
+let jobPolling = false;
+
+function el(id) { return document.getElementById(id); }
+
+function logLine(text) {
+    const console_ = el('console');
+    if (console_.textContent === 'Aucune operation en cours.') console_.textContent = '';
+    console_.textContent += (console_.textContent ? '\n' : '') + text;
+    console_.scrollTop = console_.scrollHeight;
+}
+
+function setConsole(text) {
+    el('console').textContent = text;
+    el('console').scrollTop = el('console').scrollHeight;
+}
+
+function tbCreds() {
+    return {
+        tb_url: el('tb_url').value.trim(),
+        tb_username: el('tb_username').value.trim(),
+        tb_password: el('tb_password').value
+    };
+}
+
+function post(url, body) {
+    return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+    }).then(r => r.json().then(data => ({ ok: r.ok, data })));
+}
+
+// ------------------------------------------------------------------ PROBE
+function probeEdge() {
+    const btn = el('probeBtn');
+    btn.disabled = true;
+    btn.textContent = 'Verification...';
+    el('edgeHint').textContent = 'Interrogation de la carte via SSH...';
+
+    post(`/api/edge/${IP}/probe`, {})
+        .then(({ data }) => {
+            if (!data.success) { el('edgeHint').textContent = data.error || 'Echec'; return; }
+            renderState(data.state, data.label, data.css_class);
+        })
+        .catch(e => { el('edgeHint').textContent = 'Erreur: ' + e; })
+        .finally(() => { btn.disabled = false; btn.textContent = 'Verifier maintenant'; });
+}
+
+function renderState(state, label, cssClass) {
+    const badge = el('edgeStatusBadge');
+    badge.textContent = label;
+    badge.className = 'badge ' + (cssClass || 'badge-warning');
+
+    el('edgeDocker').textContent = state.docker_version || 'absent';
+    el('edgeContainer').textContent = state.container_status || state.container_state || 'absent';
+    el('edgePostgres').textContent = state.postgres_status || 'absent';
+    el('edgeKeyState').textContent = state.edge_key || 'non configuree';
+    el('edgeCloud').textContent = (state.cloud_host || '-') + ':' + (state.cloud_port || '-');
+    el('edgeConnected').textContent = state.cloud_connected ? 'Oui' : 'Non';
+    el('edgeUrl').innerHTML = state.edge_url
+        ? `<a href="${state.edge_url}" target="_blank" rel="noopener">${state.edge_url}</a>` : '-';
+    el('edgeHint').textContent = state.error || state.cloud_hint || 'Etat mis a jour.';
+
+    if (state.edge_key && !el('edge_key').value) el('edge_key').value = state.edge_key;
+    if (state.cloud_host && !el('cloud_host').value) el('cloud_host').value = state.cloud_host;
+}
+
+// ------------------------------------------------------- THINGSBOARD API
+function showTb(html, cls) {
+    const box = el('tbResult');
+    box.className = 'tb-result ' + (cls || '');
+    box.innerHTML = html;
+}
+
+function listEdges() {
+    showTb('Connexion au serveur ThingsBoard...', '');
+    post('/api/tb/edges', tbCreds()).then(({ data }) => {
+        if (!data.success) { showTb('Erreur: ' + data.error, 'tb-error'); return; }
+        if (!data.count) { showTb('Aucun Edge dans ce tenant. Utilisez « Creer un nouvel Edge ».', 'tb-warn'); return; }
+        let html = `<p><strong>${data.count} Edge(s) dans le tenant :</strong></p><table><thead><tr>
+            <th>Nom</th><th>Type</th><th>Cle</th><th>Actif</th><th></th></tr></thead><tbody>`;
+        data.edges.forEach(edge => {
+            const active = edge.active === true ? '<span class="badge badge-success">Actif</span>'
+                        : edge.active === false ? '<span class="badge badge-warning">Inactif</span>'
+                        : '<span class="badge badge-info">?</span>';
+            html += `<tr>
+                <td><strong>${edge.name || ''}</strong></td>
+                <td>${edge.type || ''}</td>
+                <td><code>${edge.routing_key || ''}</code></td>
+                <td>${active}</td>
+                <td><button class="btn btn-secondary btn-sm" onclick="useCreds('${edge.routing_key || ''}','${edge.secret || ''}','${(edge.name || '').replace(/'/g, '')}')">Utiliser</button></td>
+            </tr>`;
+        });
+        html += '</tbody></table>';
+        showTb(html, '');
+    }).catch(e => showTb('Erreur: ' + e, 'tb-error'));
+}
+
+function lookupEdge() {
+    const key = el('edge_key').value.trim();
+    if (!key) { showTb('Saisissez d\'abord une Cle Edge ci-dessous.', 'tb-warn'); return; }
+    showTb('Recherche de l\'Edge sur le serveur...', '');
+    post('/api/tb/edge/lookup', Object.assign(tbCreds(), { edge_key: key })).then(({ data }) => {
+        if (!data.success) { showTb('Erreur: ' + data.error, 'tb-error'); return; }
+        if (!data.found) {
+            showTb(`Aucun Edge avec la cle <code>${key}</code> dans ce tenant.
+                    Vous pouvez le creer avec « Creer un nouvel Edge ».`, 'tb-warn');
+            return;
+        }
+        const edge = data.edge;
+        showTb(`Edge trouve : <strong>${edge.name}</strong> (type ${edge.type})<br>
+                Cle : <code>${edge.routing_key}</code><br>
+                Secret : <code>${edge.secret || 'non expose'}</code><br>
+                Etat serveur : ${edge.active ? 'Actif' : 'Inactif (pas encore connecte)'}
+                <br><button class="btn btn-secondary btn-sm" style="margin-top:8px"
+                    onclick="useCreds('${edge.routing_key}','${edge.secret || ''}','${(edge.name || '').replace(/'/g, '')}')">Utiliser ces identifiants</button>`,
+            edge.active ? 'tb-ok' : 'tb-warn');
+    }).catch(e => showTb('Erreur: ' + e, 'tb-error'));
+}
+
+function createEdge() {
+    const name = el('new_edge_name').value.trim();
+    if (!name) { showTb('Nom de l\'Edge obligatoire.', 'tb-warn'); return; }
+    showTb('Creation de l\'Edge dans le tenant...', '');
+    post('/api/tb/edge/create', Object.assign(tbCreds(), {
+        name: name,
+        type: el('new_edge_type').value.trim() || 'default',
+        label: el('new_edge_label').value.trim()
+    })).then(({ data }) => {
+        if (!data.success) { showTb('Erreur: ' + data.error, 'tb-error'); return; }
+        const edge = data.edge;
+        showTb(`${data.message}<br>
+                Nom : <strong>${edge.name}</strong><br>
+                Cle Edge : <code>${edge.routing_key}</code><br>
+                Secret Edge : <code>${edge.secret || 'non expose'}</code><br>
+                <em>Identifiants reportes automatiquement dans le formulaire ci-dessous.</em>`, 'tb-ok');
+        useCreds(edge.routing_key, edge.secret, edge.name);
+    }).catch(e => showTb('Erreur: ' + e, 'tb-error'));
+}
+
+function useCreds(key, secret, name) {
+    if (key) el('edge_key').value = key;
+    if (secret) el('edge_secret').value = secret;
+    if (name) el('edge_name').value = name;
+    el('edge_key').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// ----------------------------------------------------------------- DEPLOY
+function deployEdge() {
+    const payload = {
+        edge_key: el('edge_key').value.trim(),
+        edge_secret: el('edge_secret').value.trim(),
+        cloud_host: el('cloud_host').value.trim(),
+        cloud_port: el('cloud_port').value,
+        cloud_ssl: el('cloud_ssl').value === '1',
+        edge_version: el('edge_version').value.trim(),
+        edge_dir: el('edge_dir').value.trim(),
+        edge_http_port: el('edge_http_port').value,
+        edge_mqtt_port: el('edge_mqtt_port').value,
+        edge_name: el('edge_name').value.trim(),
+        hostname_prefix: el('hostname_prefix').value.trim(),
+        pg_password: el('pg_password').value,
+        reset_data: el('reset_data').checked,
+        set_hostname: el('set_hostname').checked,
+        install_docker: el('install_docker').checked,
+        pull_images: el('pull_images').checked,
+        start_edge: el('start_edge').checked
+    };
+
+    if (!confirm(`Deployer ThingsBoard Edge sur ${IP} ?\n\nCle: ${payload.edge_key}\nServeur: ${payload.cloud_host}:${payload.cloud_port}`)) return;
+
+    const btn = el('deployBtn');
+    btn.disabled = true;
+    btn.textContent = 'Deploiement en cours...';
+    setConsole('Demarrage du deploiement...');
+    el('jobBadge').textContent = 'en cours';
+    el('jobBadge').className = 'badge badge-info';
+    el('logCard').scrollIntoView({ behavior: 'smooth' });
+
+    post(`/api/edge/${IP}/deploy`, payload).then(({ ok, data }) => {
+        if (!data.success) {
+            setConsole('ERREUR: ' + (data.error || 'deploiement refuse'));
+            el('jobBadge').textContent = 'erreur';
+            el('jobBadge').className = 'badge badge-danger';
+            btn.disabled = false;
+            btn.textContent = 'Deployer / Reconfigurer l\'Edge';
+            return;
+        }
+        jobOffset = 0;
+        setConsole('');
+        pollJob();
+    }).catch(e => {
+        setConsole('Erreur reseau: ' + e);
+        btn.disabled = false;
+        btn.textContent = 'Deployer / Reconfigurer l\'Edge';
+    });
+}
+
+function pollJob() {
+    if (jobPolling) return;
+    jobPolling = true;
+
+    fetch(`/api/edge/${IP}/job?offset=${jobOffset}`)
+        .then(r => r.json())
+        .then(data => {
+            jobPolling = false;
+            const job = data.job;
+            if (!job) { return; }
+
+            (job.lines || []).forEach(logLine);
+            jobOffset = job.next_offset;
+
+            if (job.running) {
+                el('jobBadge').textContent = `en cours (${job.duration}s)`;
+                el('jobBadge').className = 'badge badge-info';
+                setTimeout(pollJob, 1500);
+                return;
+            }
+
+            const success = job.state === 'success';
+            el('jobBadge').textContent = success ? `termine (${job.duration}s)` : `echec (${job.duration}s)`;
+            el('jobBadge').className = 'badge ' + (success ? 'badge-success' : 'badge-danger');
+
+            const btn = el('deployBtn');
+            btn.disabled = false;
+            btn.textContent = 'Deployer / Reconfigurer l\'Edge';
+            probeEdge();
+        })
+        .catch(() => { jobPolling = false; setTimeout(pollJob, 3000); });
+}
+
+// ---------------------------------------------------------------- CONTROL
+function controlEdge(action) {
+    const labels = { start: 'Demarrer', stop: 'Arreter', restart: 'Redemarrer', down: 'Supprimer la stack' };
+    if (!confirm(`${labels[action] || action} l'Edge sur ${IP} ?`)) return;
+    logLine(`> Action ${action} sur ${IP}...`);
+    post(`/api/edge/${IP}/control`, { action }).then(({ data }) => {
+        logLine(data.message || (data.success ? 'OK' : 'Echec'));
+        if (data.state) probeEdge();
+    }).catch(e => logLine('Erreur: ' + e));
+}
+
+function loadLogs() {
+    logLine('> Recuperation des logs tb-edge...');
+    fetch(`/api/edge/${IP}/logs?lines=200`)
+        .then(r => r.json())
+        .then(data => setConsole(data.logs || 'Aucun log.'))
+        .catch(e => logLine('Erreur: ' + e));
+}
+
+// Reprend le suivi d'un deploiement deja lance
+{% if job and job.running %}
+jobOffset = {{ job.total_lines }};
+el('jobBadge').textContent = 'en cours';
+el('deployBtn').disabled = true;
+pollJob();
+{% endif %}
+
+{% if not state %}
+probeEdge();
+{% endif %}
+</script>
+</body>
+</html>
