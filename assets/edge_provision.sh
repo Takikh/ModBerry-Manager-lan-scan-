@@ -30,6 +30,9 @@
 #    INSTALL_DOCKER      1 = installe Docker CE si absent
 #    PULL_IMAGES         1 = docker compose pull (defaut 1)
 #    START_EDGE          1 = docker compose up -d (defaut 1)
+#    PG_IMAGE_ARCHIVE    archive .tar.gz de postgres a charger si absent
+#    ENABLE_ON_BOOT      1 = active docker + unite tb-edge-stack au boot
+#    WAIT_DB / WAIT_EDGE delais d'attente (defaut 180s / 300s)
 #    DOCKER_ONLY         1 = installe/verifie seulement Docker puis sort
 #                            (utilise AVANT le transfert de l'image, pour ne
 #                             pas perdre 1 Go de transfert sur un « docker:
@@ -46,6 +49,7 @@ EDGE_IMAGE_ARCHIVE="${EDGE_IMAGE_ARCHIVE:-}"
 EDGE_HTTP_PORT="${EDGE_HTTP_PORT:-8082}"
 EDGE_MQTT_PORT="${EDGE_MQTT_PORT:-1884}"
 PG_IMAGE="${PG_IMAGE:-postgres:16}"
+PG_IMAGE_ARCHIVE="${PG_IMAGE_ARCHIVE:-}"
 PG_PASSWORD="${PG_PASSWORD:-postgres}"
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-}"
 RESET_DATA="${RESET_DATA:-0}"
@@ -55,6 +59,10 @@ INSTALL_DOCKER="${INSTALL_DOCKER:-0}"
 PULL_IMAGES="${PULL_IMAGES:-1}"
 START_EDGE="${START_EDGE:-1}"
 DOCKER_ONLY="${DOCKER_ONLY:-0}"
+ENABLE_ON_BOOT="${ENABLE_ON_BOOT:-1}"
+BOOT_SERVICE="${BOOT_SERVICE:-tb-edge-stack.service}"
+WAIT_DB="${WAIT_DB:-180}"
+WAIT_EDGE="${WAIT_EDGE:-300}"
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 fail() { echo "[$(date '+%H:%M:%S')] ERREUR: $*" >&2; exit 1; }
@@ -242,6 +250,37 @@ for container in tb-edge tb-edge-postgres; do
   fi
 done
 
+# Conteneurs lances manuellement (docker run sans --name) : ils portent un nom
+# genere du type "loving_lamport", monopolisent les ports 8080/1883 et n'ont
+# ni base ni variables d'environnement -> ils echouent sur
+# « Connection to localhost:5432 refused ». On les nettoie.
+STRAY="$($SUDO docker ps -a --format '{{.Names}}|{{.Image}}' 2>/dev/null \
+  | grep -Ei 'tb-edge|thingsboard' \
+  | grep -vE '^(tb-edge|tb-edge-postgres)\|' \
+  | cut -d'|' -f1 || true)"
+if [ -n "$STRAY" ]; then
+  log "Conteneurs edge lances manuellement detectes -> suppression :"
+  echo "$STRAY" | while read -r name; do
+    [ -n "$name" ] || continue
+    log "  - $name (issu d'un 'docker run' manuel, sans postgres ni .env)"
+    $SUDO docker rm -f "$name" >/dev/null 2>&1 || true
+  done
+fi
+
+# Conteneurs sans tag utilisant l'ID de l'image edge (docker run <image-id>)
+EDGE_ID="$(docker image inspect "$EDGE_IMAGE" --format '{{.Id}}' 2>/dev/null | cut -c8-19 || true)"
+if [ -n "$EDGE_ID" ]; then
+  ORPHAN_BY_ID="$($SUDO docker ps -a --filter "ancestor=$EDGE_ID" --format '{{.Names}}' 2>/dev/null \
+    | grep -vE '^(tb-edge|tb-edge-postgres)$' || true)"
+  if [ -n "$ORPHAN_BY_ID" ]; then
+    echo "$ORPHAN_BY_ID" | while read -r name; do
+      [ -n "$name" ] || continue
+      log "  - $name (conteneur cree depuis l'image edge non taguee)"
+      $SUDO docker rm -f "$name" >/dev/null 2>&1 || true
+    done
+  fi
+fi
+
 if [ "$RESET_DATA" = "1" ]; then
   for volume in "${COMPOSE_PROJECT}_tb-edge-postgres-data" "${COMPOSE_PROJECT}_tb-edge-data" "${COMPOSE_PROJECT}_tb-edge-logs"; do
     if docker volume ls -q | grep -qx "$volume"; then
@@ -347,25 +386,139 @@ volumes:
 EOF
 
 # ------------------------------------------------------------ 7. demarrage
-if [ "$PULL_IMAGES" = "1" ]; then
-  # L'image edge est deja locale (etape 4) : on ne recupere que postgres.
-  log "Recuperation de $PG_IMAGE..."
-  $SUDO docker pull "$PG_IMAGE" 2>&1 | sed 's/^/    /' \
-    || log "AVERTISSEMENT: pull de $PG_IMAGE echoue, image locale utilisee si presente"
+# L'image postgres est une DEPENDANCE DURE : sans elle, le conteneur tb-edge
+# demarre, ne trouve aucune base et meurt sur
+#   Connection to localhost:5432 refused
+# On ne se contente donc plus d'un simple AVERTISSEMENT.
+if docker image inspect "$PG_IMAGE" >/dev/null 2>&1; then
+  log "Image $PG_IMAGE : deja presente localement"
+elif [ -n "$PG_IMAGE_ARCHIVE" ] && [ -f "$PG_IMAGE_ARCHIVE" ]; then
+  log "Chargement de $PG_IMAGE depuis $PG_IMAGE_ARCHIVE (docker load)..."
+  case "$PG_IMAGE_ARCHIVE" in
+    *.gz) gunzip -c "$PG_IMAGE_ARCHIVE" | $SUDO docker load 2>&1 | sed 's/^/    /' ;;
+    *)    $SUDO docker load -i "$PG_IMAGE_ARCHIVE" 2>&1 | sed 's/^/    /' ;;
+  esac
+  $SUDO rm -f "$PG_IMAGE_ARCHIVE"
+elif [ "$PULL_IMAGES" = "1" ]; then
+  log "Recuperation de $PG_IMAGE depuis le registre..."
+  $SUDO docker pull "$PG_IMAGE" 2>&1 | sed 's/^/    /' || true
 fi
 
-if [ "$START_EDGE" = "1" ]; then
-  log "Demarrage de la stack..."
-  (cd "$EDGE_DIR" && $SUDO $DC -p "$COMPOSE_PROJECT" up -d 2>&1 | sed 's/^/    /') \
-    || fail "docker compose up a echoue"
-  sleep 8
-  log "Etat des conteneurs :"
-  (cd "$EDGE_DIR" && $SUDO $DC -p "$COMPOSE_PROJECT" ps 2>&1 | sed 's/^/    /') || true
-else
+if ! docker image inspect "$PG_IMAGE" >/dev/null 2>&1; then
+  fail "Image $PG_IMAGE introuvable. C'est la base locale de l'edge : sans elle, tb-edge s'arrete sur « Connection to localhost:5432 refused ». Repliquez-la depuis la carte de reference (bouton « Transferer postgres ») ou verifiez l'acces au registre."
+fi
+log "Base locale   : $PG_IMAGE disponible"
+
+# --------------------------------------- 7b. persistance au redemarrage
+# `restart: always` ne suffit pas si le service docker n'est pas active au
+# boot : la carte redemarre et l'edge ne revient jamais. On force les deux.
+if [ "$ENABLE_ON_BOOT" = "1" ]; then
+  log "Activation de docker au demarrage de la carte"
+  $SUDO systemctl enable docker >/dev/null 2>&1 \
+    || log "AVERTISSEMENT: impossible d'activer docker.service"
+  $SUDO systemctl enable containerd >/dev/null 2>&1 || true
+
+  # Unite de rattrapage : relance `compose up -d` au boot. Utile quand le SSD
+  # (data-root) est monte tardivement et que docker demarre avant lui.
+  log "Installation de l'unite $BOOT_SERVICE"
+  $SUDO tee "/etc/systemd/system/$BOOT_SERVICE" >/dev/null <<UNIT_EOF
+[Unit]
+Description=ThingsBoard Edge stack (docker compose) - ModBerry Manager
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$EDGE_DIR
+ExecStart=/usr/bin/env $DC -p $COMPOSE_PROJECT up -d
+ExecStop=/usr/bin/env $DC -p $COMPOSE_PROJECT stop
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable "$BOOT_SERVICE" >/dev/null 2>&1 \
+    && log "L'Edge redemarrera automatiquement apres un reboot" \
+    || log "AVERTISSEMENT: activation de $BOOT_SERVICE echouee"
+fi
+
+# ------------------------------------------------------------ 8. demarrage
+if [ "$START_EDGE" != "1" ]; then
   log "START_EDGE=0 -> stack configuree mais non demarree"
+  log "=== Provisioning termine ==="
+  exit 0
+fi
+
+log "Demarrage de la stack (postgres puis tb-edge)..."
+(cd "$EDGE_DIR" && $SUDO $DC -p "$COMPOSE_PROJECT" up -d 2>&1 | sed 's/^/    /') \
+  || fail "docker compose up a echoue"
+
+# --- attente de postgres : tb-edge ne peut pas demarrer sans base prete
+log "Attente de la base postgres (max ${WAIT_DB}s)..."
+DB_READY=0
+for i in $(seq 1 "$WAIT_DB"); do
+  if $SUDO docker exec tb-edge-postgres pg_isready -U postgres -d tb_edge >/dev/null 2>&1; then
+    DB_READY=1
+    log "Base postgres prete apres ${i}s"
+    break
+  fi
+  sleep 1
+done
+
+if [ "$DB_READY" != "1" ]; then
+  log "ERREUR: la base postgres n'est pas prete apres ${WAIT_DB}s."
+  log "Etat du conteneur postgres :"
+  $SUDO docker ps -a --filter name=^/tb-edge-postgres$ \
+    --format '    {{.Names}} {{.Status}}' 2>&1 || true
+  log "Derniers logs postgres :"
+  $SUDO docker logs --tail 40 tb-edge-postgres 2>&1 | sed 's/^/    /' || true
+  fail "postgres n'a pas demarre : tb-edge tomberait sur « Connection to localhost:5432 refused »"
+fi
+
+# --- attente de tb-edge : on veut un conteneur qui TIENT, pas qui redemarre
+log "Attente du demarrage de tb-edge (max ${WAIT_EDGE}s)..."
+EDGE_UP=0
+for i in $(seq 1 "$WAIT_EDGE"); do
+  STATE="$($SUDO docker inspect -f '{{.State.Status}}' tb-edge 2>/dev/null || echo absent)"
+  if [ "$STATE" = "running" ]; then
+    # Started ThingsBoardEdge = application reellement demarree
+    if $SUDO docker logs --tail 200 tb-edge 2>&1 | grep -q 'Started ThingsBoardEdge'; then
+      EDGE_UP=1
+      log "tb-edge demarre apres ${i}s"
+      break
+    fi
+  elif [ "$STATE" = "exited" ] || [ "$STATE" = "dead" ]; then
+    log "ERREUR: le conteneur tb-edge s'est arrete (etat=$STATE)."
+    break
+  fi
+  sleep 1
+done
+
+log "Etat des conteneurs :"
+(cd "$EDGE_DIR" && $SUDO $DC -p "$COMPOSE_PROJECT" ps 2>&1 | sed 's/^/    /') || true
+
+if [ "$EDGE_UP" != "1" ]; then
+  log "Diagnostic - erreurs relevees dans les logs de tb-edge :"
+  $SUDO docker logs --tail 400 tb-edge 2>&1 \
+    | grep -Ei 'refused|ERROR|FATAL|Unable|UNAUTHORIZED|Caused by' \
+    | tail -25 | sed 's/^/    /' || true
+  if $SUDO docker logs --tail 400 tb-edge 2>&1 | grep -q '5432 refused'; then
+    log "-> La base n'etait pas joignable. Verifiez le conteneur tb-edge-postgres"
+    log "   et que SPRING_DATASOURCE_URL pointe sur 'postgres', pas 'localhost'."
+  fi
+  log "AVERTISSEMENT: tb-edge n'a pas confirme son demarrage dans le delai imparti."
+  log "La stack reste configuree ; consultez les logs depuis l'interface."
+else
+  log "Liaison au serveur :"
+  $SUDO docker logs --tail 200 tb-edge 2>&1 \
+    | grep -Ei 'connected to cloud|edge connected|UNAUTHORIZED|Failed to establish' \
+    | tail -5 | sed 's/^/    /' || log "    (pas encore d'information de liaison)"
 fi
 
 log "=== Provisioning termine ==="
 log "Interface Edge locale : http://$(hostname -I 2>/dev/null | awk '{print $1}'):$EDGE_HTTP_PORT"
 log "Verifier l'etat 'Active' de cet Edge dans ThingsBoard (Edge instances)"
-exit 0
+[ "$EDGE_UP" = "1" ] && exit 0 || exit 0

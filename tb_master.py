@@ -19,6 +19,7 @@ d'identite entre deux edges partageant la meme base).
 
 import os
 import posixpath
+import re
 import shlex
 import stat
 import time
@@ -26,6 +27,7 @@ import time
 from tb_edge import (
     DEFAULT_EDGE_DIR,
     DEFAULT_EDGE_IMAGE,
+    DEFAULT_PG_IMAGE,
     GATEWAY_DIR,
     GATEWAY_LOG,
     GATEWAY_SERVICE,
@@ -53,6 +55,8 @@ def inspect_master(ip, user, password, edge_dir=DEFAULT_EDGE_DIR, port=22):
         "hostname": None,
         "docker_version": None,
         "edge_images": [],
+        "pg_images": [],
+        "pg_image_present": False,
         "compose_present": False,
         "compose_path": posixpath.join(edge_dir, "docker-compose.yml"),
         "compose_project": None,
@@ -78,6 +82,20 @@ def inspect_master(ip, user, password, edge_dir=DEFAULT_EDGE_DIR, port=22):
                 if "|" in line:
                     name, _, size = line.partition("|")
                     info["edge_images"].append({"image": name.strip(), "size": size.strip()})
+
+            # Image postgres : obligatoire pour la stack, souvent absente des
+            # cartes neuves sans acces au registre public.
+            pg_images = ssh.out(
+                "docker images --format '{{.Repository}}:{{.Tag}}|{{.Size}}' 2>/dev/null "
+                "| grep -i '^postgres:' || true"
+            )
+            for line in (pg_images or "").splitlines():
+                if "|" in line:
+                    name, _, size = line.partition("|")
+                    info["pg_images"].append({"image": name.strip(), "size": size.strip()})
+            info["pg_image_present"] = any(
+                item["image"] == DEFAULT_PG_IMAGE for item in info["pg_images"]
+            )
 
             compose = ssh.out(f"cat {shlex.quote(info['compose_path'])} 2>/dev/null")
             info["compose_present"] = bool(compose)
@@ -142,7 +160,8 @@ def transfer_edge_image(
     « docker: command not found » (code 127).
     Retour (ok, message).
     """
-    archive_name = f"tb-edge-image-{int(time.time())}.tar.gz"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", image)[:60]
+    archive_name = f"tb-image-{safe}-{int(time.time())}.tar.gz"
     remote_archive = posixpath.join(workdir, archive_name)
     local_archive = os.path.join("/tmp", archive_name)
 
@@ -243,6 +262,89 @@ def transfer_edge_image(
                 os.remove(local_archive)
         except OSError:
             pass
+
+
+# ==================================================== IMAGE POSTGRES
+def ensure_postgres_image(
+    master_ip,
+    target_ip,
+    user,
+    password,
+    image=DEFAULT_PG_IMAGE,
+    on_line=print,
+    port=22,
+    allow_pull=True,
+):
+    """
+    Garantit que l'image postgres est disponible sur la carte cible.
+
+    C'est la panne suivante rencontree apres le probleme Docker : le script se
+    contentait d'un `docker pull postgres:16` avec un simple AVERTISSEMENT en
+    cas d'echec. Sur un parc sans acces internet, l'image n'arrivait jamais,
+    postgres ne demarrait pas, et l'edge tombait sur :
+
+        Connection to localhost:5432 refused.
+
+    Strategie, dans l'ordre :
+      1. deja presente sur la cible -> rien a faire
+      2. docker pull (si autorise et si le registre repond)
+      3. replication depuis la carte de reference (docker save -> load),
+         exactement comme pour l'image edge custom
+
+    Retour (ok, message).
+    """
+    try:
+        with SSHSession(target_ip, user, password, port=port) as target:
+            present = target.out(
+                f"docker image inspect {shlex.quote(image)} "
+                "--format '{{.Id}}' 2>/dev/null || true"
+            )
+            if present:
+                on_line(f"Image {image} deja presente sur {target_ip}.")
+                return True, f"{image} deja presente."
+
+            if allow_pull:
+                on_line(f"Recuperation de {image} depuis le registre...")
+                sudo = "" if (target.out("id -u") or "").strip() == "0" else "sudo -n "
+                rc = target.run_streaming(
+                    f"{sudo}docker pull {shlex.quote(image)} 2>&1",
+                    on_line,
+                    timeout=1800,
+                )
+                if rc == 0:
+                    check = target.out(
+                        f"docker image inspect {shlex.quote(image)} "
+                        "--format '{{.Id}}' 2>/dev/null || true"
+                    )
+                    if check:
+                        return True, f"{image} recuperee depuis le registre."
+                on_line(
+                    f"Le pull de {image} a echoue (registre inaccessible ?) "
+                    "-> replication depuis la carte de reference."
+                )
+            else:
+                on_line(f"Pull desactive -> replication de {image} depuis la carte de reference.")
+    except Exception as exception:
+        return False, f"Erreur SSH sur la cible: {exception}"
+
+    # ------------------------------- repli : replication depuis le maitre
+    if str(master_ip) == str(target_ip):
+        return False, (
+            f"{image} est absente et le registre est inaccessible. "
+            "Aucune carte de reference distincte pour la repliquer."
+        )
+
+    ok, message = transfer_edge_image(
+        master_ip, target_ip, user, password,
+        image=image, on_line=on_line, port=port,
+        min_free_gb=2.0,   # postgres:16 arm64 ~ 130 Mo compresse
+    )
+    if ok:
+        return True, f"{image} repliquee depuis {master_ip}."
+    return False, (
+        f"{image} indisponible : ni le registre ni la carte de reference n'ont pu la fournir "
+        f"({message}). Sans postgres, l'edge echoue sur « Connection to localhost:5432 refused »."
+    )
 
 
 # ------------------------------------------------ dependances de la cible

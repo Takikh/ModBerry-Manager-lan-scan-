@@ -52,7 +52,9 @@
             <div class="system-item">Stockage Docker: <strong id="edgeDataRoot">{{ (state.docker_data_root or '-') if state else '?' }}</strong></div>
             <div class="system-item">Image edge: <strong id="edgeImage">{{ ('presente' if state.image_present else 'ABSENTE') if state else '?' }}</strong></div>
             <div class="system-item">Conteneur: <strong id="edgeContainer">{{ (state.container_status or state.container_state) if state else '?' }}</strong></div>
+            <div class="system-item">Image postgres: <strong id="edgePgImage">{{ ('presente' if state.pg_image_present else 'ABSENTE') if state else '?' }}</strong></div>
             <div class="system-item">Postgres: <strong id="edgePostgres">{{ (state.postgres_status or 'absent') if state else '?' }}</strong></div>
+            <div class="system-item">Relance au boot: <strong id="edgeBoot">{{ ('oui' if state.docker_boot_enabled else 'NON') if state else '?' }}</strong></div>
             <div class="system-item">Cle Edge: <code id="edgeKeyState">{{ (state.edge_key or 'non configuree') if state else '?' }}</code></div>
             <div class="system-item">Serveur: <strong id="edgeCloud">{{ (state.cloud_host ~ ':' ~ state.cloud_port) if state and state.cloud_host else '?' }}</strong></div>
             <div class="system-item">Connexion serveur: <strong id="edgeConnected">{{ ('Oui' if state.cloud_connected else 'Non') if state else '?' }}</strong></div>
@@ -75,11 +77,22 @@
 
         <p class="small-muted" id="edgeHint">{{ state.cloud_hint if state and state.cloud_hint else 'Cliquez sur "Verifier maintenant" pour interroger la carte.' }}</p>
 
+        {% if state and state.stray_containers %}
+        <div class="warning" style="margin-top:12px">
+            <strong>Conteneur(s) lance(s) manuellement :</strong>
+            <code>{{ state.stray_containers|join(', ') }}</code>.
+            Un conteneur cree par <code>docker run</code> n'a ni base postgres ni
+            <code>.env</code> : il echoue sur <code>localhost:5432 refused</code> et occupe
+            les ports de la stack. Utilisez <strong>Nettoyer les conteneurs manuels</strong>.
+        </div>
+        {% endif %}
+
         <div class="btn-group" style="margin-top:12px">
             <button class="btn btn-secondary btn-sm" onclick="controlEdge('start')">Demarrer</button>
             <button class="btn btn-secondary btn-sm" onclick="controlEdge('restart')">Redemarrer</button>
             <button class="btn btn-warning btn-sm" onclick="controlEdge('stop')">Arreter</button>
             <button class="btn btn-secondary btn-sm" onclick="loadLogs()">Logs tb-edge</button>
+            <button class="btn btn-secondary btn-sm" onclick="loadPgLogs()">Logs postgres</button>
         </div>
 
         <p class="small-muted" style="margin-top:14px"><strong>Gateway I/O Python</strong> (service <code>tb-edge-io.service</code>, natif) :</p>
@@ -115,6 +128,59 @@
         <div class="btn-group" style="margin-top:12px">
             <button class="btn btn-secondary" id="installDockerBtn" onclick="installDocker()">Installer Docker CE sur la carte</button>
             <button class="btn btn-secondary" onclick="checkServer()">Verifier le serveur ModBerry</button>
+        </div>
+    </div>
+
+    <!-- ==================== DIAGNOSTIC ================================== -->
+    <div class="card">
+        <div class="card-header">
+            <div>
+                <h2>Diagnostic — pourquoi l'Edge ne tourne pas</h2>
+                <p class="section-note">
+                    Regroupe en un clic ce qu'il fallait chercher a la main en SSH : images,
+                    conteneurs (y compris ceux lances par <code>docker run</code>), sante de
+                    postgres, causes d'erreur dans les logs, ports occupes, relance au boot.
+                    Chaque probleme est accompagne de son correctif.
+                </p>
+            </div>
+            <button class="btn btn-primary" id="diagnoseBtn" onclick="runDiagnose()">Diagnostiquer</button>
+        </div>
+
+        <div id="diagnoseResult" class="tb-result">
+            Utile en cas d'echec : identifie notamment la panne
+            <code>Connection to localhost:5432 refused</code> (base locale absente ou
+            conteneur lance hors de la stack).
+        </div>
+
+        <div class="btn-group" style="margin-top:12px">
+            <button class="btn btn-warning" onclick="cleanupStray()">Nettoyer les conteneurs manuels</button>
+            <button class="btn btn-secondary" onclick="setBoot(true)">Activer la relance au boot</button>
+            <button class="btn btn-secondary" onclick="setBoot(false)">Desactiver</button>
+        </div>
+    </div>
+
+    <!-- ============ BASE LOCALE POSTGRES (dependance dure) ============== -->
+    <div class="card">
+        <div class="card-header">
+            <div>
+                <h2>Base locale postgres</h2>
+                <p class="section-note">
+                    <strong>Dependance obligatoire</strong> : sans cette image, le conteneur
+                    <code>tb-edge</code> demarre, ne trouve aucune base et s'arrete sur
+                    <code>Connection to localhost:5432 refused</code>. Elle est recuperee du
+                    registre si possible, <strong>sinon repliquee depuis la carte de reference</strong>
+                    (comme l'image edge) — indispensable sur un parc sans acces internet.
+                </p>
+            </div>
+            <button class="btn btn-primary" onclick="ensurePostgres()">Installer / repliquer postgres</button>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>Image postgres</label>
+                <input type="text" id="pg_image" value="{{ settings.pg_image or 'postgres:16' }}">
+                <div class="help">Identique a la carte de reference</div>
+            </div>
         </div>
     </div>
 
@@ -339,8 +405,10 @@
                     <label class="checkbox"><input type="checkbox" id="install_docker" {{ 'checked' if settings.install_docker else '' }}> Installer Docker CE si absent (avant le transfert)</label>
                     <label class="checkbox"><input type="checkbox" id="reset_data" checked> Purger les volumes de donnees (obligatoire sur image clonee)</label>
                     <label class="checkbox"><input type="checkbox" id="set_hostname" {{ 'checked' if settings.set_hostname else '' }}> Hostname unique derive du serial</label>
-                    <label class="checkbox"><input type="checkbox" id="pull_images" checked> Recuperer postgres:16</label>
-                    <label class="checkbox"><input type="checkbox" id="start_edge" checked> Demarrer l'Edge a la fin</label>
+                    <label class="checkbox"><input type="checkbox" id="pull_images" checked> Autoriser le pull depuis le registre (postgres)</label>
+                    <label class="checkbox"><input type="checkbox" id="transfer_postgres" {{ 'checked' if settings.transfer_postgres else 'checked' }}> Garantir la base postgres (pull ou replication) — obligatoire</label>
+                    <label class="checkbox"><input type="checkbox" id="enable_on_boot" {{ 'checked' if settings.enable_on_boot else 'checked' }}> Relancer l'Edge automatiquement au demarrage de la carte</label>
+                    <label class="checkbox"><input type="checkbox" id="start_edge" checked> Demarrer l'Edge a la fin (attente de postgres puis tb-edge)</label>
                     <label class="checkbox"><input type="checkbox" id="transfer_gateway" {{ 'checked' if settings.transfer_gateway else '' }}> Transferer la gateway I/O (/opt/mobilis-gateway)</label>
                     <label class="checkbox"><input type="checkbox" id="install_gateway_service" {{ 'checked' if settings.install_gateway_service else '' }}> Installer l'unite tb-edge-io.service</label>
                     <label class="checkbox"><input type="checkbox" id="enable_gateway_service"> Demarrer la gateway (bug GPIO non corrige)</label>
@@ -437,7 +505,11 @@ function renderState(state, label, cssClass) {
     el('edgeDataRoot').textContent = state.docker_data_root || '-';
     el('edgeImage').textContent = state.image_present ? 'presente' : 'ABSENTE';
     el('edgeContainer').textContent = state.container_status || state.container_state || 'absent';
-    el('edgePostgres').textContent = state.postgres_status || 'absent';
+    el('edgePgImage').textContent = state.pg_image_present ? 'presente' : 'ABSENTE';
+    el('edgePostgres').textContent = (state.postgres_status || 'absent')
+        + (state.postgres_ready ? ' (prete)' : '');
+    el('edgeBoot').textContent = state.docker_boot_enabled
+        ? ('oui' + (state.boot_service_enabled ? ' + unite' : '')) : 'NON';
     el('edgeKeyState').textContent = state.edge_key || 'non configuree';
     el('edgeCloud').textContent = (state.cloud_host || '-') + ':' + (state.cloud_port || '-');
     el('edgeConnected').textContent = state.cloud_connected ? 'Oui' : 'Non';
@@ -446,6 +518,13 @@ function renderState(state, label, cssClass) {
         ? `<a href="${state.edge_url}" target="_blank" rel="noopener">${state.edge_url}</a>` : '-';
 
     let hint = state.error || state.cloud_hint || 'Etat mis a jour.';
+    if (state.pg_image_present === false && state.docker_installed) {
+        hint = 'Base postgres ABSENTE : tb-edge echouera sur « localhost:5432 refused ». '
+             + 'Utilisez « Installer / repliquer postgres ».  |  ' + hint;
+    }
+    if (state.stray_containers && state.stray_containers.length) {
+        hint += `  |  Conteneur(s) hors stack : ${state.stray_containers.join(', ')}.`;
+    }
     if (state.gateway_gpio_errors) {
         hint += `  |  ${state.gateway_gpio_errors} erreur(s) GPIO dans les logs de la gateway.`;
     }
@@ -569,6 +648,137 @@ function installDocker() {
         btn.disabled = false;
         btn.textContent = 'Installer Docker CE sur la carte';
     });
+}
+
+// ------------------------------------------------------------ DIAGNOSTIC
+function runDiagnose() {
+    const btn = el('diagnoseBtn');
+    const box = el('diagnoseResult');
+    btn.disabled = true;
+    btn.textContent = 'Analyse...';
+    box.className = 'tb-result';
+    box.textContent = 'Analyse de la carte (images, conteneurs, postgres, logs, ports)...';
+
+    post(`/api/edge/${IP}/diagnose`, {}).then(({ data }) => {
+        if (!data.success) {
+            box.className = 'tb-result tb-error';
+            box.textContent = data.error || 'Diagnostic impossible.';
+            return;
+        }
+        const d = data.diagnose;
+        if (!d.reachable) {
+            box.className = 'tb-result tb-error';
+            box.textContent = d.error || 'Carte injoignable.';
+            return;
+        }
+
+        let html = `<p><strong>${d.verdict}</strong></p>`;
+
+        if (d.findings && d.findings.length) {
+            html += '<ul>';
+            d.findings.forEach(f => {
+                const badge = LEVEL_BADGE[f.level] || 'badge-info';
+                html += `<li><span class="badge ${badge}">${LEVEL_TEXT[f.level] || '?'}</span>
+                         <strong>${f.title}</strong>`;
+                if (f.detail) html += `<br><code style="font-size:.85em">${escapeHtml(f.detail)}</code>`;
+                if (f.fix) html += `<br><span class="small-muted">Correctif : ${f.fix}</span>`;
+                html += '</li>';
+            });
+            html += '</ul>';
+        }
+
+        html += `<p class="small-muted">Images : edge ${d.images.edge ? 'OK' : 'ABSENTE'} ·
+                 postgres ${d.images.postgres ? 'OK' : 'ABSENTE'} &nbsp;|&nbsp;
+                 Postgres pret : ${d.postgres.ready ? 'oui' : 'non'} &nbsp;|&nbsp;
+                 Boot : docker=${d.boot.docker || '?'}, unite=${d.boot.unit || '?'}</p>`;
+
+        if (d.containers && d.containers.length) {
+            html += '<table><thead><tr><th>Conteneur</th><th>Image</th><th>Etat</th></tr></thead><tbody>';
+            d.containers.forEach(c => {
+                html += `<tr><td><code>${c.name}</code></td><td>${escapeHtml(c.image)}</td><td>${escapeHtml(c.status)}</td></tr>`;
+            });
+            html += '</tbody></table>';
+        } else {
+            html += '<p class="small-muted">Aucun conteneur sur la carte.</p>';
+        }
+
+        const hasFail = (d.findings || []).some(f => f.level === 'fail');
+        box.className = 'tb-result ' + (hasFail ? 'tb-error' : 'tb-ok');
+        box.innerHTML = html;
+    }).catch(e => {
+        box.className = 'tb-result tb-error';
+        box.textContent = 'Erreur: ' + e;
+    }).finally(() => {
+        btn.disabled = false;
+        btn.textContent = 'Diagnostiquer';
+    });
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text == null ? '' : String(text);
+    return div.innerHTML;
+}
+
+function cleanupStray() {
+    if (!confirm(`Supprimer les conteneurs edge lances manuellement sur ${IP} ?\n\n`
+        + `Seuls les conteneurs hors stack sont supprimes (noms generes du type\n`
+        + `« loving_lamport »). tb-edge et tb-edge-postgres ne sont PAS touches.`)) return;
+
+    logLine(`> Nettoyage des conteneurs manuels sur ${IP}...`);
+    post(`/api/edge/${IP}/cleanup`, {}).then(({ data }) => {
+        logLine(data.message || data.error || (data.success ? 'OK' : 'Echec'));
+        runDiagnose();
+        probeEdge();
+    }).catch(e => logLine('Erreur: ' + e));
+}
+
+function setBoot(enable) {
+    const label = enable ? 'Activer' : 'Desactiver';
+    if (!confirm(`${label} la relance automatique de l'Edge au demarrage de ${IP} ?\n\n`
+        + (enable
+            ? `Active docker.service et installe l'unite tb-edge-stack.service :\n`
+              + `l'Edge repartira apres un reboot de la carte.`
+            : `L'Edge ne sera plus relance automatiquement apres un reboot.`))) return;
+
+    logLine(`> ${label} la relance au boot sur ${IP}...`);
+    post(`/api/edge/${IP}/boot`, { enable: enable }).then(({ data }) => {
+        logLine(data.message || data.error || (data.success ? 'OK' : 'Echec'));
+        probeEdge();
+    }).catch(e => logLine('Erreur: ' + e));
+}
+
+// ----------------------------------------------------- BASE POSTGRES
+function ensurePostgres() {
+    const image = el('pg_image').value.trim();
+    if (!confirm(`Installer ${image} sur ${IP} ?\n\n`
+        + `1. pull depuis le registre si celui-ci repond\n`
+        + `2. sinon replication depuis la carte de reference ${el('master_ip').value.trim()}\n\n`
+        + `Sans cette image, tb-edge s'arrete sur « localhost:5432 refused ».`)) return;
+
+    setConsole('Preparation de la base locale...');
+    el('jobBadge').textContent = 'en cours';
+    el('jobBadge').className = 'badge badge-info';
+    el('logCard').scrollIntoView({ behavior: 'smooth' });
+
+    post(`/api/edge/${IP}/postgres/ensure`, {
+        pg_image: image,
+        master_ip: el('master_ip').value.trim(),
+        pull_images: el('pull_images').checked
+    }).then(({ data }) => {
+        if (!data.success) { setConsole('ERREUR: ' + (data.error || 'refuse')); return; }
+        jobOffset = 0;
+        setConsole('');
+        pollJob(() => { runDiagnose(); loadImages(); });
+    }).catch(e => setConsole('Erreur reseau: ' + e));
+}
+
+function loadPgLogs() {
+    logLine('> Recuperation des logs postgres...');
+    fetch(`/api/edge/${IP}/logs?lines=200&container=tb-edge-postgres`)
+        .then(r => r.json())
+        .then(data => setConsole(data.logs || 'Aucun log.'))
+        .catch(e => logLine('Erreur: ' + e));
 }
 
 // -------------------------------------------------------- IMAGES DOCKER
@@ -706,6 +916,19 @@ function inspectMaster() {
             html += 'Aucune image tb-edge trouvee sur la carte de reference.<br>';
         }
 
+        if (master.pg_images && master.pg_images.length) {
+            html += 'Base(s) postgres disponibles :<ul>';
+            master.pg_images.forEach(item => {
+                html += `<li><code>${item.image}</code> — ${item.size}
+                         <button class="btn btn-secondary btn-sm" style="margin-left:6px"
+                            onclick="el('pg_image').value='${item.image}'">Choisir</button></li>`;
+            });
+            html += '</ul>';
+        } else {
+            html += `<strong>Aucune image postgres sur la carte de reference</strong> :
+                     la base ne pourra pas etre repliquee, il faudra un acces au registre.<br>`;
+        }
+
         html += `Gateway I/O : ${master.gateway_present
             ? `${master.gateway_files.length} fichier(s), service ${master.gateway_service_state || '?'}`
             : 'absente'}`;
@@ -831,6 +1054,9 @@ function deployEdge() {
         transfer_image: el('transfer_image').checked,
         force_image_transfer: el('force_image_transfer').checked,
         preflight_check: el('preflight_check').checked,
+        pg_image: el('pg_image').value.trim(),
+        transfer_postgres: el('transfer_postgres').checked,
+        enable_on_boot: el('enable_on_boot').checked,
         transfer_gateway: el('transfer_gateway').checked,
         install_gateway_service: el('install_gateway_service').checked,
         enable_gateway_service: el('enable_gateway_service').checked
@@ -843,6 +1069,11 @@ function deployEdge() {
     recap += payload.preflight_check
         ? `\nLes prerequis (Docker, disque, image) sont verifies avant tout transfert.`
         : `\nATTENTION : verification des prerequis DESACTIVEE.`;
+    recap += payload.transfer_postgres
+        ? `\nLa base ${payload.pg_image} sera garantie (pull ou replication).`
+        : `\nATTENTION : base postgres NON garantie -> risque d'echec « 5432 refused ».`;
+    if (payload.start_edge) recap += `\nLe demarrage attend postgres puis tb-edge.`;
+    if (payload.enable_on_boot) recap += `\nL'Edge sera relance automatiquement au boot.`;
     if (payload.transfer_image) recap += `\nL'image (~2.4 Go) sera transferee depuis ${payload.master_ip}.\nCompter plusieurs dizaines de minutes.`;
     if (payload.force_image_transfer) recap += `\nL'image existante sur la carte sera SUPPRIMEE puis rechargee.`;
     if (payload.reset_data) recap += `\n\nLes volumes de donnees existants seront SUPPRIMES.`;
@@ -965,6 +1196,11 @@ pollJob();
 
 {% if not state %}
 probeEdge();
+{% endif %}
+
+// Panne connue au chargement : on lance directement le diagnostic.
+{% if state and state.docker_installed and (state.status in ['db_missing', 'stopped'] or state.stray_containers) %}
+runDiagnose();
 {% endif %}
 
 // Docker absent d'apres le dernier etat connu : on met en avant l'installation.

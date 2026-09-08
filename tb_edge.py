@@ -28,6 +28,9 @@ DEFAULT_EDGE_DIR = "/root/tb-edge-mobilis"
 DEFAULT_EDGE_HTTP_PORT = 8082          # 8082 -> 8080 dans le conteneur
 DEFAULT_EDGE_MQTT_PORT = 1884          # 1884 -> 1883 (1883 est pris par mosquitto)
 DEFAULT_EDGE_IMAGE = "thingsboard/tb-edge:4.3.1.3EDGE-mobilis"
+# La base locale de l'edge. Obligatoire : sans elle, tb-edge s'arrete sur
+# « Connection to localhost:5432 refused » (voir README, panne postgres).
+DEFAULT_PG_IMAGE = "postgres:16"
 DEFAULT_CLOUD_RPC_PORT = 7071
 DEFAULT_COMPOSE_PROJECT = "tbedge-mobilis"
 DEFAULT_DOCKER_DATA_ROOT = "/mnt/ssd/docker"
@@ -264,6 +267,11 @@ def probe_edge(ip, user, password, edge_dir=DEFAULT_EDGE_DIR, port=22):
         "container_state": "absent",
         "container_status": None,
         "postgres_status": None,
+        "postgres_ready": False,
+        "pg_image_present": False,
+        "stray_containers": [],
+        "docker_boot_enabled": False,
+        "boot_service_enabled": False,
         "cloud_connected": False,
         "cloud_hint": None,
         "edge_url": None,
@@ -356,6 +364,40 @@ def probe_edge(ip, user, password, edge_dir=DEFAULT_EDGE_DIR, port=22):
                     "docker ps -a --filter name=^/tb-edge-postgres$ --format '{{.Status}}' 2>/dev/null"
                 ) or None
 
+                # L'image postgres est une dependance dure : sans elle, tb-edge
+                # meurt sur « Connection to localhost:5432 refused ».
+                state["pg_image_present"] = bool(
+                    ssh.out(
+                        f"docker image inspect {shlex.quote(DEFAULT_PG_IMAGE)} "
+                        "--format '{{.Id}}' 2>/dev/null || true"
+                    )
+                )
+                state["postgres_ready"] = ssh.run(
+                    "docker exec tb-edge-postgres pg_isready -U postgres -d tb_edge "
+                    ">/dev/null 2>&1",
+                    timeout=20,
+                )[0] == 0
+
+                # Conteneurs edge lances a la main : ils bloquent les ports.
+                stray = ssh.out(
+                    "docker ps -a --format '{{.Names}}|{{.Image}}' 2>/dev/null "
+                    "| grep -Ei 'tb-edge|thingsboard' "
+                    "| grep -vE '^(tb-edge|tb-edge-postgres)\\|' || true"
+                )
+                state["stray_containers"] = [
+                    line.split("|")[0].strip()
+                    for line in (stray or "").splitlines()
+                    if line.strip()
+                ]
+
+                # Relance apres reboot de la carte
+                state["docker_boot_enabled"] = "enabled" in ssh.out(
+                    "systemctl is-enabled docker 2>/dev/null || echo absent"
+                )
+                state["boot_service_enabled"] = "enabled" in ssh.out(
+                    "systemctl is-enabled tb-edge-stack.service 2>/dev/null || echo absent"
+                )
+
             if state["container_state"] == "running":
                 logs = ssh.out(
                     "docker logs --tail 400 tb-edge 2>&1 | "
@@ -421,6 +463,9 @@ def _derive_status(state):
         # Docker present mais image custom absente : la replication depuis la
         # carte de reference est necessaire avant tout provisioning.
         return "image_missing" if not state["image_present"] else "not_configured"
+    # Base locale manquante : cause directe de « localhost:5432 refused ».
+    if state["configured"] and not state.get("pg_image_present"):
+        return "db_missing"
     if state["container_state"] == "running":
         return "connected" if state["cloud_connected"] else "starting"
     if state["container_state"] in {"exited", "created", "paused", "restarting", "dead"}:
@@ -433,6 +478,7 @@ def _derive_status(state):
 STATUS_LABELS = {
     "not_installed": ("Docker absent", "badge-warning"),
     "image_missing": ("Image edge absente", "badge-warning"),
+    "db_missing": ("Base postgres absente", "badge-danger"),
     "not_configured": ("Edge non configure", "badge-warning"),
     "stopped": ("Edge arrete", "badge-danger"),
     "starting": ("Demarrage / non connecte", "badge-info"),
@@ -485,7 +531,9 @@ def deploy_edge(ip, user, password, options, on_line, port=22):
         "COMPOSE_PROJECT": options.get("compose_project") or DEFAULT_COMPOSE_PROJECT,
         "EDGE_HTTP_PORT": str(options.get("edge_http_port") or DEFAULT_EDGE_HTTP_PORT),
         "EDGE_MQTT_PORT": str(options.get("edge_mqtt_port") or DEFAULT_EDGE_MQTT_PORT),
+        "PG_IMAGE": options.get("pg_image") or DEFAULT_PG_IMAGE,
         "PG_PASSWORD": options.get("pg_password") or "postgres",
+        "ENABLE_ON_BOOT": "1" if options.get("enable_on_boot", True) else "0",
         "RESET_DATA": "1" if options.get("reset_data", True) else "0",
         "SET_HOSTNAME": "1" if options.get("set_hostname") else "0",
         "HOSTNAME_PREFIX": options.get("hostname_prefix") or "modberry",
@@ -564,12 +612,21 @@ def control_edge(
         return False, f"Erreur SSH: {exception}"
 
 
-def fetch_edge_logs(ip, user, password, lines=200, port=22):
-    """Recupere les dernieres lignes de logs du conteneur tb-edge."""
+def fetch_edge_logs(ip, user, password, lines=200, port=22, container="tb-edge"):
+    """
+    Recupere les dernieres lignes de logs d'un conteneur de la stack.
+
+    container : tb-edge (defaut) ou tb-edge-postgres. Les logs de postgres sont
+    indispensables pour diagnostiquer « localhost:5432 refused ».
+    """
+    if container not in {"tb-edge", "tb-edge-postgres"}:
+        return False, f"Conteneur non autorise: {container}"
+
     sudo_prefix = "" if user == "root" else "sudo -n "
+    name = shlex.quote(container)
     command = (
-        f"docker logs --tail {int(lines)} tb-edge 2>&1 "
-        f"|| {sudo_prefix}docker logs --tail {int(lines)} tb-edge 2>&1"
+        f"docker logs --tail {int(lines)} {name} 2>&1 "
+        f"|| {sudo_prefix}docker logs --tail {int(lines)} {name} 2>&1"
     )
     try:
         with SSHSession(ip, user, password, port=port) as ssh:
