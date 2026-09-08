@@ -30,6 +30,10 @@
 #    INSTALL_DOCKER      1 = installe Docker CE si absent
 #    PULL_IMAGES         1 = docker compose pull (defaut 1)
 #    START_EDGE          1 = docker compose up -d (defaut 1)
+#    DOCKER_ONLY         1 = installe/verifie seulement Docker puis sort
+#                            (utilise AVANT le transfert de l'image, pour ne
+#                             pas perdre 1 Go de transfert sur un « docker:
+#                             command not found »)
 # =============================================================================
 set -uo pipefail
 
@@ -50,6 +54,7 @@ HOSTNAME_PREFIX="${HOSTNAME_PREFIX:-modberry}"
 INSTALL_DOCKER="${INSTALL_DOCKER:-0}"
 PULL_IMAGES="${PULL_IMAGES:-1}"
 START_EDGE="${START_EDGE:-1}"
+DOCKER_ONLY="${DOCKER_ONLY:-0}"
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 fail() { echo "[$(date '+%H:%M:%S')] ERREUR: $*" >&2; exit 1; }
@@ -61,20 +66,42 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # ---------------------------------------------------------------- 0. controles
-[ -n "${EDGE_KEY:-}" ]       || fail "EDGE_KEY (Cle Edge) manquant"
-[ -n "${EDGE_SECRET:-}" ]    || fail "EDGE_SECRET (Secret Edge) manquant"
-[ -n "${CLOUD_RPC_HOST:-}" ] || fail "CLOUD_RPC_HOST manquant"
+if [ "$DOCKER_ONLY" != "1" ]; then
+  [ -n "${EDGE_KEY:-}" ]       || fail "EDGE_KEY (Cle Edge) manquant"
+  [ -n "${EDGE_SECRET:-}" ]    || fail "EDGE_SECRET (Secret Edge) manquant"
+  [ -n "${CLOUD_RPC_HOST:-}" ] || fail "CLOUD_RPC_HOST manquant"
+fi
 
-log "=== Provisioning ThingsBoard Edge (ModBerry CM5) ==="
-log "Repertoire    : $EDGE_DIR (projet $COMPOSE_PROJECT)"
-log "Serveur       : $CLOUD_RPC_HOST:$CLOUD_RPC_PORT (ssl=$CLOUD_RPC_SSL)"
-log "Image edge    : $EDGE_IMAGE"
-log "Ports hote    : HTTP $EDGE_HTTP_PORT -> 8080 | MQTT $EDGE_MQTT_PORT -> 1883"
-log "Cle Edge      : ${EDGE_KEY:0:8}...${EDGE_KEY: -4}"
-log "Reset volumes : $RESET_DATA"
+if [ "$DOCKER_ONLY" = "1" ]; then
+  log "=== Preparation des dependances Docker (mode DOCKER_ONLY) ==="
+  log "Aucune modification de la stack Edge dans ce mode."
+else
+  log "=== Provisioning ThingsBoard Edge (ModBerry CM5) ==="
+  log "Repertoire    : $EDGE_DIR (projet $COMPOSE_PROJECT)"
+  log "Serveur       : ${CLOUD_RPC_HOST:-?}:$CLOUD_RPC_PORT (ssl=$CLOUD_RPC_SSL)"
+  log "Image edge    : $EDGE_IMAGE"
+  log "Ports hote    : HTTP $EDGE_HTTP_PORT -> 8080 | MQTT $EDGE_MQTT_PORT -> 1883"
+  log "Cle Edge      : ${EDGE_KEY:0:8}...${EDGE_KEY: -4}"
+  log "Reset volumes : $RESET_DATA"
+fi
 
 log "OS            : $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") / $(uname -m)"
 log "Modele        : $(tr -d '\000' < /proc/device-tree/model 2>/dev/null || echo inconnu)"
+
+# ---------------------------------------- 0b. dependances systeme requises
+# Sans ces outils, les etapes suivantes echouent au milieu d'un transfert.
+MISSING_TOOLS=""
+for tool in gzip tar awk sed; do
+  command -v "$tool" >/dev/null 2>&1 || MISSING_TOOLS="$MISSING_TOOLS $tool"
+done
+if [ -n "$MISSING_TOOLS" ]; then
+  log "Outils manquants :$MISSING_TOOLS -> installation"
+  $SUDO apt-get update -qq || log "AVERTISSEMENT: apt-get update a echoue"
+  # shellcheck disable=SC2086
+  $SUDO apt-get install -y -qq $MISSING_TOOLS \
+    || fail "outils requis non installes :$MISSING_TOOLS"
+fi
+log "Dependances   : gzip/tar/awk/sed presents"
 
 # ------------------------------------------------------- 1. identite unique
 SERIAL="$(tr -d '\000' < /proc/device-tree/serial-number 2>/dev/null || true)"
@@ -149,6 +176,15 @@ log "Compose       : $DC"
 
 $SUDO systemctl is-active docker >/dev/null 2>&1 || $SUDO systemctl start docker || true
 
+# Verification effective du daemon : docker peut etre installe et injoignable.
+if ! $SUDO docker info >/dev/null 2>&1; then
+  log "Daemon Docker injoignable -> tentative de demarrage"
+  $SUDO systemctl enable --now docker >/dev/null 2>&1 || true
+  sleep 4
+  $SUDO docker info >/dev/null 2>&1 || fail "le daemon Docker ne repond pas (systemctl status docker)"
+fi
+log "Daemon Docker : operationnel"
+
 # -------------------------------- 2b. stockage Docker sur SSD (optionnel)
 if [ -n "$DOCKER_DATA_ROOT" ]; then
   CURRENT_ROOT="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo '')"
@@ -171,6 +207,17 @@ if [ -n "$DOCKER_DATA_ROOT" ]; then
   else
     log "Stockage Docker : deja $DOCKER_DATA_ROOT"
   fi
+fi
+
+# ------------------- 2c. sortie anticipee : preparation des dependances
+if [ "$DOCKER_ONLY" = "1" ]; then
+  log "DOCKER_ONLY=1 -> dependances pretes, aucune modification de la stack"
+  log "Docker        : $(docker --version 2>/dev/null)"
+  log "Compose       : $($DC version --short 2>/dev/null || echo '?')"
+  log "Stockage      : $(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo '?')"
+  log "Espace libre  : $(df -Ph / | awk 'NR==2{print $4}') sur /"
+  log "=== Dependances Docker verifiees ==="
+  exit 0
 fi
 
 # ------------------------------------- 3. arret de la stack precedente

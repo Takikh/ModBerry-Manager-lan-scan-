@@ -122,6 +122,8 @@ def transfer_edge_image(
     on_line=print,
     workdir="/tmp",
     port=22,
+    force=False,
+    min_free_gb=6.0,
 ):
     """
     Transfere l'image Docker custom du maitre vers la cible.
@@ -131,6 +133,13 @@ def transfer_edge_image(
 
     Strategie : docker save | gzip cote maitre vers un fichier temporaire,
     rapatriement en streaming via SFTP, envoi vers la cible, puis docker load.
+
+    force=True : supprime l'image existante sur la cible et la retransfere
+    (utile quand la carte de reference a ete mise a jour).
+
+    Un controle de dependances est effectue AVANT le transfert : sans docker
+    sur la cible, on ne perd pas 6 minutes a pousser 1 Go pour finir sur
+    « docker: command not found » (code 127).
     Retour (ok, message).
     """
     archive_name = f"tb-edge-image-{int(time.time())}.tar.gz"
@@ -138,14 +147,26 @@ def transfer_edge_image(
     local_archive = os.path.join("/tmp", archive_name)
 
     try:
-        # ---------------------------------------------- cible : deja presente ?
+        # ------------------------------- cible : dependances et etat de l'image
         with SSHSession(target_ip, user, password, port=port) as target:
+            ok, message = _assert_docker_ready(target, target_ip, on_line, min_free_gb)
+            if not ok:
+                return False, message
+
             already = target.out(
                 f"docker image inspect {shlex.quote(image)} "
                 "--format '{{.Id}}' 2>/dev/null || true"
             )
+            if already and force:
+                on_line(f"force=1 -> suppression de l'image existante {image} sur {target_ip}...")
+                removed, remove_message = _remove_image(target, image, on_line)
+                on_line(remove_message)
+                if not removed:
+                    return False, f"Impossible de supprimer l'image existante: {remove_message}"
+                already = None
             if already:
                 on_line(f"L'image {image} est deja presente sur {target_ip}, transfert inutile.")
+                on_line("Cochez « Forcer le retransfert » pour la remplacer.")
                 return True, "Image deja presente sur la cible."
 
         # ------------------------------------------- maitre : export de l'image
@@ -185,6 +206,11 @@ def transfer_edge_image(
         # ------------------------------------------- cible : envoi et chargement
         on_line(f"Envoi de l'archive vers {target_ip}...")
         with SSHSession(target_ip, user, password, port=port) as target:
+            # Deuxieme controle : le daemon peut s'etre arrete entre-temps.
+            ok, message = _assert_docker_ready(target, target_ip, on_line, min_free_gb)
+            if not ok:
+                return False, message
+
             local_size = os.path.getsize(local_archive)
             _sftp_upload(target, local_archive, remote_archive, local_size, on_line)
 
@@ -217,6 +243,177 @@ def transfer_edge_image(
                 os.remove(local_archive)
         except OSError:
             pass
+
+
+# ------------------------------------------------ dependances de la cible
+def _free_gb(session, path="/"):
+    out = session.out(f"df -Pk {shlex.quote(path)} 2>/dev/null | awk 'NR==2{{print $4}}'")
+    try:
+        return round(int((out or "0").strip()) / (1024 * 1024), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _assert_docker_ready(session, ip, on_line, min_free_gb=6.0):
+    """
+    Verifie que la cible peut reellement executer `docker load`.
+
+    C'est le garde-fou qui manquait : le transfert de 1 Go se terminait par
+    « bash: line 1: docker: command not found ».
+    Retour (ok, message).
+    """
+    version = session.out("docker --version 2>/dev/null")
+    if "Docker version" not in (version or ""):
+        return False, (
+            f"Docker est absent de {ip} : « docker load » echouerait (code 127). "
+            "Activez « Installer Docker CE si absent » ou lancez « Verifier les prerequis » "
+            "puis « Installer Docker » avant le transfert."
+        )
+    on_line(f"Docker sur la cible : {version}")
+
+    if session.run("docker info >/dev/null 2>&1", timeout=60)[0] != 0:
+        sudo = "" if (session.out("id -u") or "").strip() == "0" else "sudo -n "
+        on_line("Daemon Docker injoignable -> tentative de demarrage...")
+        session.run(f"{sudo}systemctl start docker", timeout=60)
+        if session.run("docker info >/dev/null 2>&1", timeout=60)[0] != 0:
+            return False, (
+                f"Le daemon Docker de {ip} ne repond pas (docker info echoue). "
+                "Verifiez : systemctl status docker."
+            )
+        on_line("Daemon Docker demarre.")
+
+    for tool in ("gunzip", "gzip"):
+        if not session.out(f"command -v {tool} 2>/dev/null || true"):
+            return False, (
+                f"{tool} est absent de {ip} : impossible de decompresser l'archive. "
+                f"Installez-le (apt-get install -y gzip)."
+            )
+
+    free = _free_gb(session, "/")
+    if free is not None and free < min_free_gb:
+        return False, (
+            f"Espace disque insuffisant sur {ip} : {free} Go libres, "
+            f"{min_free_gb} Go requis (archive ~1 Go + image ~2.4 Go)."
+        )
+    if free is not None:
+        on_line(f"Espace libre sur la cible : {free} Go")
+
+    return True, "Dependances de la cible validees."
+
+
+def _remove_image(session, image, on_line=print):
+    """Supprime une image Docker sur l'hote de la session (rmi -f)."""
+    sudo = "" if (session.out("id -u") or "").strip() == "0" else "sudo -n "
+
+    # Les conteneurs qui utilisent l'image doivent d'abord etre supprimes.
+    users = session.out(
+        "docker ps -a --filter ancestor=" + shlex.quote(image) + " --format '{{.Names}}' 2>/dev/null"
+    )
+    for name in [line.strip() for line in (users or "").splitlines() if line.strip()]:
+        on_line(f"  suppression du conteneur {name} qui utilise l'image...")
+        session.run(f"{sudo}docker rm -f {shlex.quote(name)}", timeout=120)
+
+    rc, out, err = session.run(
+        f"{sudo}docker rmi -f {shlex.quote(image)} 2>&1", timeout=300
+    )
+    output = (out or err or "").strip()
+    if rc != 0:
+        return False, output or f"docker rmi a echoue (code {rc})."
+
+    still = session.out(
+        f"docker image inspect {shlex.quote(image)} --format '{{{{.Id}}}}' 2>/dev/null || true"
+    )
+    if still:
+        return False, f"L'image {image} est toujours presente apres suppression."
+    return True, f"Image {image} supprimee."
+
+
+def list_images(ip, user, password, filter_text="tb-edge", port=22):
+    """
+    Liste les images Docker d'une carte (filtrees sur tb-edge par defaut).
+
+    Sert a l'ecran de gestion d'image : voir ce qui occupe le disque et
+    supprimer une image obsolete avant d'en charger une nouvelle.
+    """
+    info = {
+        "ip": str(ip),
+        "reachable": False,
+        "docker_installed": False,
+        "images": [],
+        "disk_free_gb": None,
+        "error": None,
+    }
+    try:
+        with SSHSession(ip, user, password, port=port) as ssh:
+            info["reachable"] = True
+            version = ssh.out("docker --version 2>/dev/null")
+            info["docker_installed"] = "Docker version" in (version or "")
+            info["docker_version"] = version or None
+
+            if not info["docker_installed"]:
+                info["error"] = "Docker absent sur cette carte."
+                return info
+
+            listing = ssh.out(
+                "docker images --format "
+                "'{{.Repository}}:{{.Tag}}|{{.Size}}|{{.ID}}|{{.CreatedSince}}' 2>/dev/null"
+            )
+            for line in (listing or "").splitlines():
+                parts = line.split("|")
+                if len(parts) < 2:
+                    continue
+                name = parts[0].strip()
+                if filter_text and filter_text.lower() not in name.lower():
+                    continue
+                info["images"].append(
+                    {
+                        "image": name,
+                        "size": parts[1].strip(),
+                        "id": parts[2].strip() if len(parts) > 2 else "",
+                        "created": parts[3].strip() if len(parts) > 3 else "",
+                    }
+                )
+
+            info["disk_free_gb"] = _free_gb(ssh, "/")
+    except Exception as exception:
+        info["error"] = f"SSH indisponible: {exception}"
+
+    return info
+
+
+def delete_image(ip, user, password, image, on_line=print, port=22):
+    """
+    Supprime une image Docker sur une carte.
+
+    Utile avant de charger une nouvelle version de l'image edge : le disque
+    des CM5 ne permet pas de garder plusieurs images de 2.4 Go.
+    Retour (ok, message).
+    """
+    if not image or not str(image).strip():
+        return False, "Nom d'image manquant."
+    image = str(image).strip()
+
+    try:
+        with SSHSession(ip, user, password, port=port) as ssh:
+            version = ssh.out("docker --version 2>/dev/null")
+            if "Docker version" not in (version or ""):
+                return False, f"Docker est absent de {ip} : aucune image a supprimer."
+
+            present = ssh.out(
+                f"docker image inspect {shlex.quote(image)} --format '{{{{.Id}}}}' 2>/dev/null || true"
+            )
+            if not present:
+                return True, f"L'image {image} n'est pas presente sur {ip}."
+
+            on_line(f"Suppression de {image} sur {ip}...")
+            ok, message = _remove_image(ssh, image, on_line)
+            if ok:
+                free = _free_gb(ssh, "/")
+                if free is not None:
+                    message += f" Espace libre : {free} Go."
+            return ok, message
+    except Exception as exception:
+        return False, f"Erreur SSH: {exception}"
 
 
 def _progress_reporter(label, total, on_line):

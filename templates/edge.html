@@ -91,6 +91,61 @@
         </div>
     </div>
 
+    <!-- ================ 0. PREREQUIS / DEPENDANCES ======================= -->
+    <div class="card">
+        <div class="card-header">
+            <div>
+                <h2>0. Prerequis et dependances</h2>
+                <p class="section-note">
+                    Verification <strong>avant</strong> toute operation longue : SSH, privileges root,
+                    <strong>Docker</strong>, plugin compose, outils systeme (gzip/tar), espace disque,
+                    et presence de l'image sur la carte de reference.
+                    Sans Docker sur la cible, <code>docker load</code> echoue en
+                    <code>command not found</code> (code 127) <em>apres</em> avoir transfere ~1 Go.
+                </p>
+            </div>
+            <button class="btn btn-primary" id="preflightBtn" onclick="runPreflight()">Verifier les prerequis</button>
+        </div>
+
+        <div id="preflightResult" class="tb-result">
+            Lancez la verification avant de deployer : elle detecte l'absence de Docker,
+            le manque d'espace disque et l'image manquante sur la carte de reference.
+        </div>
+
+        <div class="btn-group" style="margin-top:12px">
+            <button class="btn btn-secondary" id="installDockerBtn" onclick="installDocker()">Installer Docker CE sur la carte</button>
+            <button class="btn btn-secondary" onclick="checkServer()">Verifier le serveur ModBerry</button>
+        </div>
+    </div>
+
+    <!-- ============ GESTION DE L'IMAGE EDGE SUR LA CARTE ================= -->
+    <div class="card">
+        <div class="card-header">
+            <div>
+                <h2>Image edge sur cette carte</h2>
+                <p class="section-note">
+                    Le stockage des CM5 ne permet pas de conserver plusieurs images de ~2.4 Go.
+                    Supprimez l'image actuelle avant d'en charger une nouvelle, ou forcez le
+                    retransfert depuis la carte de reference.
+                </p>
+            </div>
+            <button class="btn btn-secondary" onclick="loadImages()">Lister les images</button>
+        </div>
+
+        <div id="imagesResult" class="tb-result">
+            Cliquez sur « Lister les images » pour voir les images <code>tb-edge</code> presentes sur {{ device.ip }}.
+        </div>
+
+        <div class="btn-group" style="margin-top:12px">
+            <button class="btn btn-primary" onclick="transferImage(false)">Transferer l'image manquante</button>
+            <button class="btn btn-warning" onclick="transferImage(true)">Remplacer l'image (supprimer + retransferer)</button>
+        </div>
+        <p class="small-muted">
+            « Remplacer » arrete la stack, supprime l'image existante puis la recharge depuis
+            la carte de reference. La configuration (<code>.env</code>) et l'identite Edge ne sont pas touchees.
+        </p>
+    </div>
+
     <!-- ==================== CARTE DE REFERENCE (MAITRE) ==================== -->
     <div class="card">
         <div class="card-header">
@@ -142,12 +197,20 @@
             </div>
             <div class="form-group">
                 <label>Utilisateur tenant</label>
-                <input type="text" id="tb_username" placeholder="tenant@thingsboard.org" autocomplete="off">
+                <input type="text" id="tb_username"
+                       value="{{ default_tb_username }}"
+                       placeholder="tenant@mobilis.dz" autocomplete="off">
+                <div class="help">Identifiant par defaut du parc Mobilis</div>
             </div>
             <div class="form-group">
                 <label>Mot de passe tenant</label>
-                <input type="password" id="tb_password" placeholder="••••••••" autocomplete="new-password">
-                <div class="help">Utilise uniquement pour cet appel, jamais enregistre.</div>
+                <input type="password" id="tb_password"
+                       value="{{ default_tb_password }}"
+                       placeholder="••••••••" autocomplete="new-password">
+                <div class="help">
+                    Pre-rempli avec le mot de passe par defaut du parc.
+                    Utilise uniquement pour cet appel, jamais enregistre.
+                </div>
             </div>
         </div>
 
@@ -270,8 +333,10 @@
                     </div>
                 </div>
                 <div class="checkbox-grid">
+                    <label class="checkbox"><input type="checkbox" id="preflight_check" {{ 'checked' if settings.preflight_check else 'checked' }}> Verifier les prerequis avant de commencer (recommande)</label>
                     <label class="checkbox"><input type="checkbox" id="transfer_image" {{ 'checked' if settings.transfer_image else '' }}> Transferer l'image edge depuis la carte de reference</label>
-                    <label class="checkbox"><input type="checkbox" id="install_docker" {{ 'checked' if settings.install_docker else '' }}> Installer Docker CE si absent</label>
+                    <label class="checkbox"><input type="checkbox" id="force_image_transfer" {{ 'checked' if settings.force_image_transfer else '' }}> Forcer le retransfert (supprime l'image existante)</label>
+                    <label class="checkbox"><input type="checkbox" id="install_docker" {{ 'checked' if settings.install_docker else '' }}> Installer Docker CE si absent (avant le transfert)</label>
                     <label class="checkbox"><input type="checkbox" id="reset_data" checked> Purger les volumes de donnees (obligatoire sur image clonee)</label>
                     <label class="checkbox"><input type="checkbox" id="set_hostname" {{ 'checked' if settings.set_hostname else '' }}> Hostname unique derive du serial</label>
                     <label class="checkbox"><input type="checkbox" id="pull_images" checked> Recuperer postgres:16</label>
@@ -389,6 +454,226 @@ function renderState(state, label, cssClass) {
     if (state.edge_key && !el('edge_key').value) el('edge_key').value = state.edge_key;
     if (state.cloud_host && !el('cloud_host').value) el('cloud_host').value = state.cloud_host;
     if (state.edge_image && !el('edge_image').value) el('edge_image').value = state.edge_image;
+}
+
+// -------------------------------------------------------------- PREREQUIS
+const LEVEL_BADGE = { ok: 'badge-success', warn: 'badge-warning', fail: 'badge-danger' };
+const LEVEL_TEXT = { ok: 'OK', warn: 'Attention', fail: 'Bloquant' };
+
+function renderChecks(title, report) {
+    if (!report) return '';
+    let html = `<p style="margin-top:10px"><strong>${title}</strong> — ${report.summary}</p><ul>`;
+    (report.checks || []).forEach(item => {
+        const badge = LEVEL_BADGE[item.level] || 'badge-info';
+        html += `<li><span class="badge ${badge}">${LEVEL_TEXT[item.level] || '?'}</span>
+                 ${item.label} : <code>${item.value || '-'}</code>`;
+        if (item.hint && item.level !== 'ok') html += `<br><span class="small-muted">${item.hint}</span>`;
+        html += '</li>';
+    });
+    return html + '</ul>';
+}
+
+function runPreflight() {
+    const btn = el('preflightBtn');
+    const box = el('preflightResult');
+    btn.disabled = true;
+    btn.textContent = 'Verification...';
+    box.className = 'tb-result';
+    box.textContent = 'Verification des dependances (SSH, Docker, compose, disque, image)...';
+
+    post(`/api/edge/${IP}/preflight`, {
+        master_ip: el('master_ip') ? el('master_ip').value.trim() : '',
+        edge_image: el('edge_image') ? el('edge_image').value.trim() : '',
+        edge_dir: el('edge_dir') ? el('edge_dir').value.trim() : '',
+        transfer_image: el('transfer_image') ? el('transfer_image').checked : true,
+        install_docker: el('install_docker') ? el('install_docker').checked : true
+    }).then(({ data }) => {
+        if (!data.success) {
+            box.className = 'tb-result tb-error';
+            box.textContent = data.error || 'Verification impossible.';
+            return;
+        }
+        const pf = data.preflight;
+        let html = `<p><strong>${pf.summary}</strong></p>`;
+        html += renderChecks(`Carte cible ${IP}`, pf.reports.target);
+        if (pf.reports.master) html += renderChecks('Carte de reference', pf.reports.master);
+        html += renderChecks('Serveur ModBerry Manager', pf.reports.local);
+
+        if (pf.needs_docker_install) {
+            html += `<p class="warning">Docker est absent de ${IP}. Cliquez sur
+                     « Installer Docker CE sur la carte » avant tout transfert d'image,
+                     ou laissez le deploiement s'en charger : il installe Docker
+                     <strong>avant</strong> de pousser l'archive.</p>`;
+        }
+        if (pf.image_present_target) {
+            html += `<p class="small-muted">L'image edge est deja sur la carte : le transfert sera ignore
+                     sauf si vous cochez « Forcer le retransfert ».</p>`;
+        }
+
+        box.className = 'tb-result ' + (pf.ok ? 'tb-ok' : 'tb-error');
+        box.innerHTML = html;
+        el('installDockerBtn').style.display = pf.needs_docker_install ? '' : 'none';
+    }).catch(e => {
+        box.className = 'tb-result tb-error';
+        box.textContent = 'Erreur: ' + e;
+    }).finally(() => {
+        btn.disabled = false;
+        btn.textContent = 'Verifier les prerequis';
+    });
+}
+
+function checkServer() {
+    const box = el('preflightResult');
+    box.className = 'tb-result';
+    box.textContent = 'Verification du serveur ModBerry Manager...';
+    fetch('/api/preflight/server').then(r => r.json()).then(data => {
+        const pf = data.preflight;
+        box.className = 'tb-result ' + (pf.ok ? 'tb-ok' : 'tb-error');
+        box.innerHTML = renderChecks('Serveur ModBerry Manager', pf);
+    }).catch(e => {
+        box.className = 'tb-result tb-error';
+        box.textContent = 'Erreur: ' + e;
+    });
+}
+
+function installDocker() {
+    if (!confirm(`Installer Docker CE sur ${IP} ?\n\nAucune modification de la stack Edge : `
+        + `uniquement les paquets docker-ce, le plugin compose et le demarrage du daemon.`)) return;
+
+    const btn = el('installDockerBtn');
+    btn.disabled = true;
+    btn.textContent = 'Installation...';
+    setConsole('Installation de Docker CE...');
+    el('jobBadge').textContent = 'en cours';
+    el('jobBadge').className = 'badge badge-info';
+    el('logCard').scrollIntoView({ behavior: 'smooth' });
+
+    post(`/api/edge/${IP}/docker/install`, {
+        docker_data_root: el('docker_data_root') ? el('docker_data_root').value.trim() : ''
+    }).then(({ data }) => {
+        if (!data.success) {
+            setConsole('ERREUR: ' + (data.error || data.message || 'installation refusee'));
+            btn.disabled = false;
+            btn.textContent = 'Installer Docker CE sur la carte';
+            return;
+        }
+        jobOffset = 0;
+        setConsole('');
+        pollJob(() => {
+            btn.disabled = false;
+            btn.textContent = 'Installer Docker CE sur la carte';
+            runPreflight();
+        });
+    }).catch(e => {
+        setConsole('Erreur reseau: ' + e);
+        btn.disabled = false;
+        btn.textContent = 'Installer Docker CE sur la carte';
+    });
+}
+
+// -------------------------------------------------------- IMAGES DOCKER
+function loadImages() {
+    const box = el('imagesResult');
+    box.className = 'tb-result';
+    box.textContent = 'Interrogation de la carte...';
+
+    fetch(`/api/edge/${IP}/images`).then(r => r.json()).then(data => {
+        const docker = data.docker || {};
+        if (!docker.reachable) {
+            box.className = 'tb-result tb-error';
+            box.textContent = docker.error || 'Carte injoignable.';
+            return;
+        }
+        if (!docker.docker_installed) {
+            box.className = 'tb-result tb-error';
+            box.innerHTML = `Docker est <strong>absent</strong> de cette carte : aucune image a gerer.<br>
+                             Utilisez « Installer Docker CE sur la carte » (section Prerequis).`;
+            return;
+        }
+        if (!docker.images.length) {
+            box.className = 'tb-result tb-warn';
+            box.innerHTML = `Aucune image <code>tb-edge</code> sur ${IP}.
+                             Espace libre : ${docker.disk_free_gb ?? '?'} Go.<br>
+                             Transferez l'image depuis la carte de reference.`;
+            return;
+        }
+
+        let html = `<p>Docker : ${docker.docker_version || '?'} — espace libre
+                    <strong>${docker.disk_free_gb ?? '?'} Go</strong></p>
+                    <table><thead><tr><th>Image</th><th>Taille</th><th>Creee</th><th></th></tr></thead><tbody>`;
+        docker.images.forEach(item => {
+            html += `<tr>
+                <td><code>${item.image}</code></td>
+                <td>${item.size}</td>
+                <td>${item.created || '-'}</td>
+                <td><button class="btn btn-warning btn-sm"
+                     onclick="deleteImage('${item.image}')">Supprimer</button></td>
+            </tr>`;
+        });
+        html += '</tbody></table>';
+        box.className = 'tb-result tb-ok';
+        box.innerHTML = html;
+    }).catch(e => {
+        box.className = 'tb-result tb-error';
+        box.textContent = 'Erreur: ' + e;
+    });
+}
+
+function deleteImage(image) {
+    if (!confirm(`Supprimer l'image ${image} sur ${IP} ?\n\n`
+        + `La stack Edge sera arretee (docker compose down) car elle utilise cette image.\n`
+        + `L'identite Edge (.env) et les volumes de donnees ne sont pas touches.\n\n`
+        + `Vous pourrez ensuite charger une nouvelle image.`)) return;
+
+    const box = el('imagesResult');
+    box.className = 'tb-result';
+    box.textContent = `Suppression de ${image}...`;
+    logLine(`> Suppression de l'image ${image} sur ${IP}...`);
+
+    post(`/api/edge/${IP}/images/delete`, { image: image, stop_stack: true }).then(({ data }) => {
+        (data.log || []).forEach(logLine);
+        logLine(data.message || data.error || (data.success ? 'OK' : 'Echec'));
+        box.className = 'tb-result ' + (data.success ? 'tb-ok' : 'tb-error');
+        box.innerHTML = (data.message || data.error || '') +
+            '<br><span class="small-muted">Rechargement de la liste...</span>';
+        setTimeout(loadImages, 800);
+        if (data.state) probeEdge();
+    }).catch(e => {
+        box.className = 'tb-result tb-error';
+        box.textContent = 'Erreur: ' + e;
+    });
+}
+
+function transferImage(force) {
+    const image = el('edge_image').value.trim();
+    const master = el('master_ip').value.trim();
+    let message = `Transferer l'image ${image} depuis ${master} vers ${IP} ?\n\n`
+        + `Archive ~1 Go compressee (~2.4 Go decompressee), compter plusieurs dizaines de minutes.`;
+    if (force) {
+        message += `\n\nMODE REMPLACEMENT : l'image existante sera SUPPRIMEE avant le transfert.`;
+    }
+    message += `\n\nDocker sera installe automatiquement s'il est absent, AVANT le transfert.`;
+    if (!confirm(message)) return;
+
+    setConsole('Preparation du transfert...');
+    el('jobBadge').textContent = 'en cours';
+    el('jobBadge').className = 'badge badge-info';
+    el('logCard').scrollIntoView({ behavior: 'smooth' });
+
+    post(`/api/edge/${IP}/images/transfer`, {
+        master_ip: master,
+        image: image,
+        force: !!force,
+        install_docker: el('install_docker').checked
+    }).then(({ data }) => {
+        if (!data.success) {
+            setConsole('ERREUR: ' + (data.error || 'transfert refuse'));
+            return;
+        }
+        jobOffset = 0;
+        setConsole('');
+        pollJob(() => loadImages());
+    }).catch(e => setConsole('Erreur reseau: ' + e));
 }
 
 // ------------------------------------------------------ CARTE DE REFERENCE
@@ -544,6 +829,8 @@ function deployEdge() {
         pull_images: el('pull_images').checked,
         start_edge: el('start_edge').checked,
         transfer_image: el('transfer_image').checked,
+        force_image_transfer: el('force_image_transfer').checked,
+        preflight_check: el('preflight_check').checked,
         transfer_gateway: el('transfer_gateway').checked,
         install_gateway_service: el('install_gateway_service').checked,
         enable_gateway_service: el('enable_gateway_service').checked
@@ -553,7 +840,11 @@ function deployEdge() {
         + `Cle Edge : ${payload.edge_key}\n`
         + `Serveur  : ${payload.cloud_host}:${payload.cloud_port}\n`
         + `Image    : ${payload.edge_image}\n`;
+    recap += payload.preflight_check
+        ? `\nLes prerequis (Docker, disque, image) sont verifies avant tout transfert.`
+        : `\nATTENTION : verification des prerequis DESACTIVEE.`;
     if (payload.transfer_image) recap += `\nL'image (~2.4 Go) sera transferee depuis ${payload.master_ip}.\nCompter plusieurs dizaines de minutes.`;
+    if (payload.force_image_transfer) recap += `\nL'image existante sur la carte sera SUPPRIMEE puis rechargee.`;
     if (payload.reset_data) recap += `\n\nLes volumes de donnees existants seront SUPPRIMES.`;
     if (!confirm(recap)) return;
 
@@ -587,7 +878,7 @@ function deployEdge() {
     });
 }
 
-function pollJob() {
+function pollJob(onDone) {
     if (jobPolling) return;
     jobPolling = true;
 
@@ -604,7 +895,7 @@ function pollJob() {
             if (job.running) {
                 el('jobBadge').textContent = `en cours (${job.duration}s)`;
                 el('jobBadge').className = 'badge badge-info';
-                setTimeout(pollJob, 1500);
+                setTimeout(() => pollJob(onDone), 1500);
                 return;
             }
 
@@ -616,8 +907,9 @@ function pollJob() {
             btn.disabled = false;
             btn.textContent = 'Deployer / Reconfigurer l\'Edge';
             probeEdge();
+            if (typeof onDone === 'function') onDone(job);
         })
-        .catch(() => { jobPolling = false; setTimeout(pollJob, 3000); });
+        .catch(() => { jobPolling = false; setTimeout(() => pollJob(onDone), 3000); });
 }
 
 // ---------------------------------------------------------------- CONTROL
@@ -673,6 +965,17 @@ pollJob();
 
 {% if not state %}
 probeEdge();
+{% endif %}
+
+// Docker absent d'apres le dernier etat connu : on met en avant l'installation.
+{% if state and not state.docker_installed %}
+el('preflightResult').className = 'tb-result tb-error';
+el('preflightResult').innerHTML =
+    'Dernier etat connu : <strong>Docker absent</strong> de cette carte. '
+  + 'Lancez « Verifier les prerequis » puis « Installer Docker CE » : sans Docker, '
+  + 'le transfert de l\'image se termine par <code>docker: command not found</code>.';
+{% else %}
+el('installDockerBtn').style.display = 'none';
 {% endif %}
 </script>
 </body>

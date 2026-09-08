@@ -20,6 +20,7 @@ from flask import Flask, flash, jsonify, redirect, render_template, request, ses
 
 import tb_edge
 import tb_master
+import tb_preflight
 from jobs import manager as job_manager
 from tb_cloud import ThingsBoardClient, ThingsBoardError
 
@@ -39,12 +40,19 @@ DEFAULT_WEB_IDENTITY = os.environ.get("MODBERRY_WEB_IDENTITY", "admin-ip")
 DEFAULT_WEB_EMAIL = os.environ.get("MODBERRY_WEB_EMAIL", "admin-ip@modberry.local")
 DEFAULT_WEB_PASSWORD = os.environ.get("MODBERRY_WEB_PASSWORD", "takieddine")
 
+# Identifiants tenant ThingsBoard du parc Mobilis : ce sont toujours les memes
+# sur cette infrastructure, on les prefixe donc dans l'interface. Le mot de
+# passe n'est utilise que le temps de l'appel REST, jamais persiste.
+DEFAULT_TB_USERNAME = os.environ.get("MODBERRY_TB_USERNAME", "tenant@mobilis.dz")
+DEFAULT_TB_PASSWORD = os.environ.get("MODBERRY_TB_PASSWORD", "tenant")
+
 # Valeurs par defaut alignees sur la carte de reference techbase (10.0.0.26).
 DEFAULT_EDGE_SETTINGS = {
     "cloud_host": os.environ.get("MODBERRY_TB_HOST", "10.0.0.1"),
     "cloud_port": int(os.environ.get("MODBERRY_TB_RPC_PORT", "7071")),
     "cloud_ssl": False,
     "cloud_web_url": os.environ.get("MODBERRY_TB_URL", ""),
+    "tb_username": DEFAULT_TB_USERNAME,
     "master_ip": os.environ.get("MODBERRY_MASTER_IP", tb_master.DEFAULT_MASTER_IP),
     "edge_image": tb_edge.DEFAULT_EDGE_IMAGE,
     "edge_dir": tb_edge.DEFAULT_EDGE_DIR,
@@ -59,9 +67,13 @@ DEFAULT_EDGE_SETTINGS = {
     "pull_images": True,
     "start_edge": True,
     "transfer_image": True,
+    "force_image_transfer": False,
     "transfer_gateway": True,
     "install_gateway_service": True,
     "enable_gateway_service": False,  # bug GPIO a corriger avant demarrage
+    # Verification des dependances avant toute operation longue : evite de
+    # perdre 6 minutes de transfert sur un « docker: command not found ».
+    "preflight_check": True,
 }
 
 scan_lock = threading.Lock()
@@ -850,6 +862,8 @@ def edge_page(ip):
         status_label=tb_edge.status_label,
         job=job,
         default_edge_version=tb_edge.DEFAULT_EDGE_VERSION,
+        default_tb_username=settings.get("tb_username") or DEFAULT_TB_USERNAME,
+        default_tb_password=DEFAULT_TB_PASSWORD,
     )
 
 
@@ -869,6 +883,251 @@ def api_edge_probe(ip):
 
     label, css_class = tb_edge.status_label(state.get("status"))
     return jsonify({"success": True, "state": state, "label": label, "css_class": css_class})
+
+
+# ------------------- Prerequis : Docker et dependances systeme ---------------
+
+
+@app.route("/api/edge/<ip>/preflight", methods=["POST", "GET"])
+@login_required
+def api_edge_preflight(ip):
+    """
+    Verifie les prerequis avant deploiement : SSH, privileges, Docker, compose,
+    outils systeme, espace disque, image sur la carte de reference.
+
+    A appeler AVANT le transfert de l'image : c'est ce qui evite de pousser
+    ~1 Go pour finir sur « docker: command not found » (code 127).
+    """
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    settings = get_edge_settings()
+
+    master_ip = (
+        payload.get("master_ip") or settings.get("master_ip") or tb_master.DEFAULT_MASTER_IP
+    ).strip()
+    image = (payload.get("edge_image") or settings.get("edge_image") or tb_edge.DEFAULT_EDGE_IMAGE).strip()
+    edge_dir = (payload.get("edge_dir") or settings.get("edge_dir") or tb_edge.DEFAULT_EDGE_DIR).strip()
+    need_image = parse_bool(payload.get("transfer_image", settings.get("transfer_image", True)))
+    install_docker_allowed = parse_bool(
+        payload.get("install_docker", settings.get("install_docker", True))
+    )
+
+    if str(master_ip) == str(ip):
+        need_image = False
+
+    user, password = ssh_credentials()
+    report = tb_preflight.preflight_all(
+        ip,
+        master_ip,
+        user,
+        password,
+        image=image,
+        edge_dir=edge_dir,
+        need_image_transfer=need_image,
+        install_docker_allowed=install_docker_allowed,
+    )
+    return jsonify({"success": True, "preflight": report})
+
+
+@app.route("/api/edge/<ip>/docker/install", methods=["POST"])
+@login_required
+def api_edge_docker_install(ip):
+    """
+    Installe Docker CE sur la carte, sans toucher a la stack Edge.
+
+    Etape independante et rejouable : on prepare la carte, puis on transfere
+    l'image seulement lorsque Docker repond.
+    """
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    settings = get_edge_settings()
+    docker_data_root = (
+        payload.get("docker_data_root") or settings.get("docker_data_root") or ""
+    ).strip()
+
+    user, password = ssh_credentials()
+
+    def target(job):
+        job.log(f"=== Installation des dependances Docker sur {ip} ===")
+        ok, message = tb_preflight.install_docker(
+            ip, user, password, on_line=job.log,
+            docker_data_root=docker_data_root or None,
+        )
+        if ok:
+            job.log("")
+            job.log("Nouvelle verification des prerequis...")
+            report = tb_preflight.preflight_target(
+                ip, user, password,
+                image=settings.get("edge_image", tb_edge.DEFAULT_EDGE_IMAGE),
+                need_image_transfer=True,
+            )
+            job.log(report["summary"])
+            job.meta["preflight"] = report
+        return ok, message
+
+    started, job = job_manager.start(
+        f"deploy:{ip}", f"Installation Docker {ip}", target,
+        meta={"ip": ip, "kind": "docker-install"},
+    )
+    if not started:
+        return jsonify(
+            {"success": True, "started": False, "running": True, "job": job.snapshot(0),
+             "message": "Une operation est deja en cours sur cette carte."}
+        ), 202
+
+    return jsonify({"success": True, "started": True, "running": True, "job": job.snapshot(0)}), 202
+
+
+# --------------------------- Gestion des images Docker -----------------------
+
+
+@app.route("/api/edge/<ip>/images", methods=["GET"])
+@login_required
+def api_edge_images(ip):
+    """Liste les images Docker de la carte (filtre tb-edge par defaut)."""
+    filter_text = request.args.get("filter", "tb-edge")
+    if filter_text.lower() in {"all", "*", "tout"}:
+        filter_text = ""
+
+    user, password = ssh_credentials()
+    return jsonify({"success": True, "docker": tb_master.list_images(
+        ip, user, password, filter_text=filter_text
+    )})
+
+
+@app.route("/api/edge/<ip>/images/delete", methods=["POST"])
+@login_required
+def api_edge_image_delete(ip):
+    """
+    Supprime une image Docker de la carte.
+
+    Indispensable avant de charger une nouvelle image edge : le stockage des
+    CM5 ne permet pas de conserver plusieurs images de ~2.4 Go. La suppression
+    force aussi le retransfert au prochain deploiement.
+    """
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    settings = get_edge_settings()
+    image = (payload.get("image") or settings.get("edge_image") or "").strip()
+    if not image:
+        return jsonify({"success": False, "error": "Nom d'image manquant."}), 400
+
+    stop_stack = parse_bool(payload.get("stop_stack", True))
+    user, password = ssh_credentials()
+    messages = []
+
+    # L'image est utilisee par la stack : on l'arrete d'abord, sinon rmi echoue.
+    if stop_stack:
+        stopped, stop_message = tb_edge.control_edge(
+            ip, user, password, "down",
+            edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR),
+            compose_project=settings.get("compose_project", tb_edge.DEFAULT_COMPOSE_PROJECT),
+        )
+        messages.append(
+            f"Arret de la stack : {'ok' if stopped else 'non necessaire ou echoue'}"
+        )
+
+    ok, message = tb_master.delete_image(
+        ip, user, password, image, on_line=lambda line: messages.append(line)
+    )
+    messages.append(message)
+
+    docker = tb_master.list_images(ip, user, password, filter_text="tb-edge")
+
+    state = None
+    try:
+        state = tb_edge.probe_edge(
+            ip, user, password, edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR)
+        )
+        store_edge_state(ip, state)
+    except Exception:
+        state = None
+
+    return jsonify(
+        {
+            "success": ok,
+            "message": message,
+            "log": messages,
+            "docker": docker,
+            "state": state,
+        }
+    ), (200 if ok else 500)
+
+
+@app.route("/api/edge/<ip>/images/transfer", methods=["POST"])
+@login_required
+def api_edge_image_transfer(ip):
+    """
+    Transfere (ou retransfere) l'image edge depuis la carte de reference,
+    sans reconfigurer la stack. Verifie Docker au prealable.
+    """
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    settings = get_edge_settings()
+
+    master_ip = (payload.get("master_ip") or settings.get("master_ip") or tb_master.DEFAULT_MASTER_IP).strip()
+    image = (payload.get("image") or payload.get("edge_image") or settings.get("edge_image") or tb_edge.DEFAULT_EDGE_IMAGE).strip()
+    force = parse_bool(payload.get("force", False))
+    install_docker_allowed = parse_bool(
+        payload.get("install_docker", settings.get("install_docker", True))
+    )
+
+    if str(master_ip) == str(ip):
+        return jsonify({"success": False, "error": "La cible est la carte de reference elle-meme."}), 400
+
+    user, password = ssh_credentials()
+
+    def target(job):
+        job.log(f"=== Transfert de l'image {image} vers {ip} ===")
+        job.log(f"Carte de reference : {master_ip} | force={force}")
+
+        job.log("")
+        job.log("--- Prerequis ---")
+        report = tb_preflight.preflight_all(
+            ip, master_ip, user, password,
+            image=image,
+            need_image_transfer=True,
+            install_docker_allowed=install_docker_allowed,
+        )
+        for scope, part in report["reports"].items():
+            if not part:
+                continue
+            job.log(f"[{scope}] {part['summary']}")
+            for item in part["checks"]:
+                marker = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}.get(item["level"], "    ")
+                job.log(f"  {marker} {item['label']}: {item['value'] or '-'}")
+
+        if not report["ok"]:
+            details = "; ".join(f"{item['label']} ({item['scope']})" for item in report["blocking"])
+            return False, f"Prerequis non satisfaits : {details}"
+
+        if report["needs_docker_install"]:
+            if not install_docker_allowed:
+                return False, (
+                    "Docker est absent de la carte : activez l'installation automatique "
+                    "avant de transferer l'image."
+                )
+            job.log("")
+            job.log("--- Installation de Docker CE (avant transfert) ---")
+            ok, message = tb_preflight.install_docker(ip, user, password, on_line=job.log)
+            job.log(message)
+            if not ok:
+                return False, message
+
+        job.log("")
+        job.log("--- Transfert de l'image ---")
+        return tb_master.transfer_edge_image(
+            master_ip, ip, user, password,
+            image=image, on_line=job.log, force=force,
+        )
+
+    started, job = job_manager.start(
+        f"deploy:{ip}", f"Image edge {ip}", target,
+        meta={"ip": ip, "kind": "image-transfer", "image": image},
+    )
+    if not started:
+        return jsonify(
+            {"success": True, "started": False, "running": True, "job": job.snapshot(0),
+             "message": "Une operation est deja en cours sur cette carte."}
+        ), 202
+
+    return jsonify({"success": True, "started": True, "running": True, "job": job.snapshot(0)}), 202
 
 
 @app.route("/api/edge/<ip>/deploy", methods=["POST"])
@@ -906,6 +1165,8 @@ def api_edge_deploy(ip):
     do_transfer_gateway = parse_bool(payload.get("transfer_gateway", settings.get("transfer_gateway", True)))
     install_gateway_service = parse_bool(payload.get("install_gateway_service", settings.get("install_gateway_service", True)))
     enable_gateway_service = parse_bool(payload.get("enable_gateway_service", False))
+    force_image_transfer = parse_bool(payload.get("force_image_transfer", settings.get("force_image_transfer", False)))
+    do_preflight = parse_bool(payload.get("preflight_check", settings.get("preflight_check", True)))
 
     valid, error = tb_edge.validate_edge_key(options["edge_key"])
     if not valid:
@@ -944,6 +1205,8 @@ def api_edge_deploy(ip):
             "install_docker": options["install_docker"],
             "set_hostname": options["set_hostname"],
             "master_ip": master_ip,
+            "preflight_check": do_preflight,
+            "force_image_transfer": force_image_transfer,
         }
     )
 
@@ -960,34 +1223,101 @@ def api_edge_deploy(ip):
         job.log(f"Projet compose     : {options['compose_project']} dans {options['edge_dir']}")
         job.log(f"Ports hote         : HTTP {options['edge_http_port']} | MQTT {options['edge_mqtt_port']}")
         job.log(f"Reset volumes      : {options['reset_data']} | Hostname unique: {options['set_hostname']}")
+        job.log(f"Prerequis verifies : {do_preflight} | Retransfert force: {force_image_transfer}")
 
-        # ---- Etape 1 : image Docker custom (absente des registres publics)
+        # ---- Etape 1 : verification des prerequis (avant toute operation longue)
+        job.log("")
+        job.log("--- Etape 1/4 : verification des prerequis ---")
+        if do_preflight:
+            report = tb_preflight.preflight_all(
+                ip,
+                master_ip,
+                user,
+                password,
+                image=options["edge_image"],
+                edge_dir=options["edge_dir"],
+                need_image_transfer=do_transfer_image,
+                install_docker_allowed=options["install_docker"],
+            )
+            for scope, part in report["reports"].items():
+                if not part:
+                    continue
+                job.log(f"[{scope}] {part['summary']}")
+                for item in part["checks"]:
+                    marker = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}.get(item["level"], "    ")
+                    job.log(f"  {marker} {item['label']}: {item['value'] or '-'}")
+                    if item["hint"] and item["level"] != "ok":
+                        job.log(f"       -> {item['hint']}")
+
+            job.meta["preflight"] = report
+            if not report["ok"]:
+                details = "; ".join(
+                    f"{item['label']} ({item['scope']})" for item in report["blocking"]
+                )
+                return False, (
+                    f"Prerequis non satisfaits, deploiement annule avant tout transfert : {details}"
+                )
+        else:
+            job.log("Verification desactivee (option decochee).")
+
+        # ---- Etape 2 : Docker doit exister AVANT le transfert de l'image.
+        # Sans cela, on pousse 1 Go pour finir sur « docker: command not found ».
+        job.log("")
+        job.log("--- Etape 2/4 : dependances Docker sur la cible ---")
+        docker_ready = tb_preflight.preflight_target(
+            ip,
+            user,
+            password,
+            image=options["edge_image"],
+            install_docker_allowed=options["install_docker"],
+            need_image_transfer=False,
+        )
+        if docker_ready.get("docker_installed") and docker_ready.get("docker_running"):
+            job.log(f"Docker deja operationnel : {docker_ready.get('docker_version')}")
+        elif options["install_docker"]:
+            job.log("Docker absent ou inactif -> installation de Docker CE maintenant.")
+            ok, message = tb_preflight.install_docker(
+                ip, user, password,
+                on_line=job.log,
+                docker_data_root=options["docker_data_root"] or None,
+            )
+            job.log(message)
+            if not ok:
+                return False, f"Installation de Docker interrompue: {message}"
+        else:
+            return False, (
+                "Docker est absent de la carte et l'option « Installer Docker CE si absent » "
+                "est decochee : le transfert de l'image echouerait (docker load, code 127)."
+            )
+
+        # ---- Etape 3 : image Docker custom (absente des registres publics)
         if do_transfer_image:
             job.log("")
-            job.log("--- Etape 1/3 : image Docker custom ---")
+            job.log("--- Etape 3/4 : image Docker custom ---")
             ok, message = tb_master.transfer_edge_image(
                 master_ip, ip, user, password,
                 image=options["edge_image"], on_line=job.log,
+                force=force_image_transfer,
             )
             job.log(message)
             if not ok:
                 return False, f"Transfert de l'image interrompu: {message}"
         else:
             job.log("")
-            job.log("--- Etape 1/3 : transfert d'image ignore ---")
+            job.log("--- Etape 3/4 : transfert d'image ignore ---")
 
-        # ---- Etape 2 : Docker CE + compose + demarrage
+        # ---- Etape 4 : compose + demarrage
         job.log("")
-        job.log("--- Etape 2/3 : provisioning de la stack ---")
+        job.log("--- Etape 4/4 : provisioning de la stack ---")
         ok, message = tb_edge.deploy_edge(ip, user, password, options, job.log)
 
         if ok:
             record_key_assignment(ip, options["edge_key"], options.get("edge_name"))
 
-        # ---- Etape 3 : gateway I/O Python
+        # ---- Complement : gateway I/O Python
         if ok and do_transfer_gateway:
             job.log("")
-            job.log("--- Etape 3/3 : gateway I/O Python ---")
+            job.log("--- Complement : gateway I/O Python ---")
             gateway_ok, gateway_message = tb_master.transfer_gateway(
                 master_ip, ip, user, password,
                 on_line=job.log,
@@ -999,7 +1329,7 @@ def api_edge_deploy(ip):
                 job.log("AVERTISSEMENT: la stack Edge est en place, mais la gateway a echoue.")
         elif ok:
             job.log("")
-            job.log("--- Etape 3/3 : transfert de la gateway ignore ---")
+            job.log("--- Complement : transfert de la gateway ignore ---")
 
         # ---- Verification finale
         job.log("")
@@ -1111,13 +1441,21 @@ def api_edge_settings():
         if not valid:
             return jsonify({"success": False, "error": error}), 400
         updates["cloud_host"] = error
-    for key in ("cloud_web_url", "edge_version", "edge_dir", "hostname_prefix"):
+    for key in (
+        "cloud_web_url", "edge_version", "edge_image", "edge_dir",
+        "compose_project", "hostname_prefix", "tb_username", "master_ip",
+    ):
         if key in payload and str(payload[key]).strip():
             updates[key] = str(payload[key]).strip()
     for key in ("cloud_port", "edge_http_port", "edge_mqtt_port"):
         if key in payload:
             updates[key] = parse_int(payload[key], DEFAULT_EDGE_SETTINGS[key])
-    for key in ("cloud_ssl", "install_docker", "set_hostname", "reset_data", "pull_images", "start_edge"):
+    for key in (
+        "cloud_ssl", "install_docker", "set_hostname", "reset_data",
+        "pull_images", "start_edge", "transfer_image", "force_image_transfer",
+        "preflight_check", "transfer_gateway", "install_gateway_service",
+        "enable_gateway_service",
+    ):
         if key in payload:
             updates[key] = parse_bool(payload[key])
 
@@ -1134,8 +1472,12 @@ def build_tb_client(payload):
     if not base_url and settings.get("cloud_host"):
         base_url = f"http://{settings['cloud_host']}:8080"
 
-    username = (payload.get("tb_username") or "").strip()
-    password = payload.get("tb_password") or ""
+    # Les identifiants tenant du parc Mobilis sont constants : s'ils ne sont
+    # pas fournis, on retombe sur tenant@mobilis.dz / tenant.
+    username = (payload.get("tb_username") or "").strip() or (
+        settings.get("tb_username") or DEFAULT_TB_USERNAME
+    )
+    password = payload.get("tb_password") or DEFAULT_TB_PASSWORD
     verify_ssl = parse_bool(payload.get("tb_verify_ssl", False))
 
     if not base_url:
@@ -1145,8 +1487,14 @@ def build_tb_client(payload):
 
     client = ThingsBoardClient(base_url, username, password, verify_ssl=verify_ssl)
     client.login()
+    updates = {}
     if base_url != settings.get("cloud_web_url"):
-        save_edge_settings({"cloud_web_url": base_url})
+        updates["cloud_web_url"] = base_url
+    if username != settings.get("tb_username"):
+        # Seul l'identifiant est memorise, jamais le mot de passe.
+        updates["tb_username"] = username
+    if updates:
+        save_edge_settings(updates)
     return client
 
 
@@ -1378,6 +1726,13 @@ def api_gateway_logs(ip):
             return jsonify({"success": True, "logs": logs or "Aucun log disponible."})
     except Exception as exception:
         return jsonify({"success": False, "error": f"Erreur SSH: {exception}"}), 500
+
+
+@app.route("/api/preflight/server")
+@login_required
+def api_preflight_server():
+    """Prerequis du serveur ModBerry Manager lui-meme (relais de l'archive)."""
+    return jsonify({"success": True, "preflight": tb_preflight.preflight_local()})
 
 
 @app.route("/api/edge/assignments")
