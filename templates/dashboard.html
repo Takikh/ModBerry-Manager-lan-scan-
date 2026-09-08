@@ -150,6 +150,8 @@
                                     <span class="badge badge-danger">Edge arrete</span>
                                 {% elif device.edge_status == 'not_configured' %}
                                     <span class="badge badge-warning">Non configure</span>
+                                {% elif device.edge_status == 'image_missing' %}
+                                    <span class="badge badge-warning">Image edge absente</span>
                                 {% elif device.edge_status == 'not_installed' %}
                                     <span class="badge badge-warning">Docker absent</span>
                                 {% elif device.tb_edge and device.tb_edge.startswith('Up') %}
@@ -305,6 +307,7 @@
             starting:       ['Demarrage / non connecte', 'badge-info'],
             stopped:        ['Edge arrete', 'badge-danger'],
             not_configured: ['Non configure', 'badge-warning'],
+            image_missing:  ['Image edge absente', 'badge-warning'],
             not_installed:  ['Docker absent', 'badge-warning'],
             error:          ['Injoignable', 'badge-danger']
         };

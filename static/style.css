@@ -169,11 +169,18 @@ a {
 }
 
 .flash-error,
-.flash-success {
+.flash-success,
+.flash-info {
   padding: 12px 14px;
   border-radius: 12px;
   border-left: 4px solid;
   margin-bottom: 10px;
+}
+
+.flash-info {
+  background: #eef4ff;
+  color: #1e4b8f;
+  border-color: #2563eb;
 }
 
 .flash-error {
