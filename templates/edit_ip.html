@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ModBerry Manager - Changer IP</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <div class="eyebrow">IP Change</div>
+                    <h1>Changer l'IP</h1>
+                    <p class="subtitle">Modifier l'adresse IP du peripherique selectionne.</p>
+                </div>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Retour</a>
+            </div>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    <div class="flash-messages">
+                        {% for category, message in messages %}
+                            <div class="flash-{{ category }}">{{ message }}</div>
+                        {% endfor %}
+                    </div>
+                {% endif %}
+            {% endwith %}
+
+            <div class="current-ip">
+                <strong>IP actuelle :</strong> {{ modberry.ip }}<br>
+                <strong>Hostname :</strong> {{ modberry.hostname or 'unknown' }}<br>
+                <strong>Serial :</strong> {{ (modberry.serial or 'unknown')[:16] }}...<br>
+                <strong>Type :</strong> {{ modberry.kind or 'device' }}
+            </div>
+
+            <div class="warning">
+                <strong>Attention :</strong> Après avoir changé l'IP, vous serez déconnecté de cette carte.
+                Vous devrez vous reconnecter sur la nouvelle IP.
+            </div>
+
+            <form method="POST">
+                <div class="form-group">
+                    <label>Nouvelle IP</label>
+                    <input type="text" name="new_ip" value="{{ modberry.ip }}" required>
+                    <div class="help">Exemple: 10.0.0.28</div>
+                </div>
+
+                <div class="form-group">
+                    <label>Masque</label>
+                    <input type="text" name="new_mask" value="24">
+                    <div class="help">Exemple: 24 pour /24</div>
+                </div>
+
+                <div class="form-group">
+                    <label>Passerelle (Gateway)</label>
+                    <input type="text" name="gateway" value="10.0.0.1">
+                    <div class="help">Adresse de la passerelle</div>
+                </div>
+
+                <div class="form-group">
+                    <label>DNS</label>
+                    <input type="text" name="dns" value="8.8.8.8">
+                    <div class="help">Serveur DNS</div>
+                </div>
+
+                <div class="btn-group">
+                    <button type="submit" class="btn btn-primary">Appliquer le changement</button>
+                    <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Retour</a>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

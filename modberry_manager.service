@@ -1,0 +1,14 @@
+[Unit]
+Description=ModBerry Manager - Interface web de gestion
+After=network.target
+
+[Service]
+Type=simple
+User=mobilis
+WorkingDirectory=/home/mobilis/modberry_manager_takieddine
+ExecStart=/home/mobilis/modberry_manager_takieddine/.venv/bin/python /home/mobilis/modberry_manager_takieddine/app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

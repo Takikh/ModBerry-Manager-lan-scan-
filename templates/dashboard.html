@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ModBerry Manager - Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <div class="header dashboard-header">
+            <div>
+                <div class="eyebrow">LAN Discovery Service</div>
+                <h1>ModBerry Manager</h1>
+                <p class="subtitle">Scan des reseaux physiques, exclusion Docker, et changement d'IP en un clic.</p>
+            </div>
+            <div class="user-info">
+                <span class="email">{{ session.email }}</span>
+                <a href="{{ url_for('logout') }}" class="btn btn-danger">Deconnexion</a>
+            </div>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flash-messages">
+                    {% for category, message in messages %}
+                        <div class="flash-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        <div class="summary-grid">
+            <div class="summary-card">
+                <div class="summary-label">Reseaux detectes</div>
+                <div class="summary-value" id="networkCount">{{ networks|length }}</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Peripheriques detectes</div>
+                <div class="summary-value" id="deviceCount">{{ devices|length }}</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">ModBerry</div>
+                <div class="summary-value" id="modberryCount">{{ modberries|length }}</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Etat</div>
+                <div class="summary-value small" id="scanState">{{ 'En cours' if scan_state.running else 'Pret' }}</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <h2>Systeme</h2>
+                    <p class="section-note">Le service tourne en continu sous systemd et relance des scans automatiques toutes les 2 heures.</p>
+                </div>
+                <a href="{{ url_for('api_export') }}" class="btn btn-secondary" target="_blank" rel="noopener">Exporter JSON</a>
+            </div>
+            <div class="system-grid" id="systemStatus">
+                <div class="system-item">Service: <strong>modberry_manager.service</strong></div>
+                <div class="system-item">Auto scan: <strong id="autoScanState">{{ 'Active' if scan_settings.auto_scan_enabled else 'Desactive' }}</strong></div>
+                <div class="system-item">Intervalle: <strong id="autoScanInterval">{{ (scan_settings.auto_scan_interval_seconds // 3600) if scan_settings.auto_scan_interval_seconds else 2 }}h</strong></div>
+                <div class="system-item">Prochain scan: <strong id="nextAutoScan">{{ 'N/A' }}</strong></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <h2>Scan reseau</h2>
+                    <p class="section-note">Detecte les hôtes joignables sur les réseaux physiques et ignore les ponts Docker.</p>
+                </div>
+                <button onclick="scanNetwork()" class="btn btn-primary" id="scanBtn">Scanner maintenant</button>
+            </div>
+            <div>
+                <small class="small-muted">Dernier scan: <span id="lastScan">{{ last_scan or 'Jamais' }}</span></small>
+            </div>
+            <div class="scan-meta small-muted" id="scanMeta">
+                {% if scan_state.running %}
+                    Réseau courant: <span id="currentNetwork">{{ scan_state.current_network or 'en attente' }}</span>
+                    | Progression: <span id="scanProgressText">{{ scan_state.completed_networks }}/{{ scan_state.total_networks }}</span>
+                    | Source: <span id="scanSource">{{ scan_state.last_source or 'manual' }}</span>
+                {% else %}
+                    Prêt pour un nouveau scan.
+                {% endif %}
+            </div>
+            <div class="network-list" id="networkList">
+                {% for network in networks %}
+                    <span class="network-chip">{{ network }}</span>
+                {% endfor %}
+            </div>
+            <div class="scan-progress" id="scanProgress">
+                <div class="spinner"></div>
+                <p style="margin-top: 10px;">Scan en cours...</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <h2>Peripheriques decouverts</h2>
+                    <p class="section-note">Les hôtes SSH peuvent changer d'IP. Les autres restent visibles en lecture seule.</p>
+                </div>
+                <span class="badge badge-info" id="countBadge">{{ devices|length }} hotes</span>
+            </div>
+            <div id="deviceTable">
+                {% if devices %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>IP</th>
+                            <th>Hostname</th>
+                            <th>Serial</th>
+                            <th>Type</th>
+                            <th>SSH</th>
+                            <th>Reseau</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for device in devices %}
+                        <tr>
+                            <td><strong>{{ device.ip }}</strong></td>
+                            <td>{{ device.hostname }}</td>
+                            <td><code>{{ (device.serial or 'unknown')[:16] }}...</code></td>
+                            <td>
+                                {% if device.kind == 'modberry' %}
+                                    <span class="badge badge-success">ModBerry</span>
+                                {% elif device.kind == 'ssh-device' %}
+                                    <span class="badge badge-info">SSH device</span>
+                                {% else %}
+                                    <span class="badge badge-warning">Reachable</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if device.ssh %}
+                                    <span class="badge badge-success">Ouvert</span>
+                                {% else %}
+                                    <span class="badge badge-warning">Ferme</span>
+                                {% endif %}
+                            </td>
+                            <td><code>{{ device.subnet }}</code></td>
+                            <td>
+                                {% if device.ssh %}
+                                    <a href="{{ url_for('edit_ip', ip=device.ip) }}" class="btn btn-warning btn-sm">Changer IP</a>
+                                {% else %}
+                                    <span class="small-muted">Pas d'SSH</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <div class="empty-state">
+                    <div class="icon">LAN</div>
+                    <p>Aucun peripherique detecte</p>
+                    <p style="font-size: 14px;">Cliquez sur Scanner maintenant pour lancer la decouverte.</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function scanNetwork() {
+            const btn = document.getElementById('scanBtn');
+            const progress = document.getElementById('scanProgress');
+            const lastScan = document.getElementById('lastScan');
+            const scanState = document.getElementById('scanState');
+            const scanMeta = document.getElementById('scanMeta');
+
+            btn.disabled = true;
+            btn.textContent = 'Scan en cours...';
+            progress.style.display = 'block';
+            scanState.textContent = 'En cours';
+            scanMeta.innerHTML = 'Préparation du scan...';
+
+            fetch('/scan', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success && (data.started || data.running)) {
+                    lastScan.textContent = 'Scan en cours...';
+                    pollScanResult();
+                } else {
+                    alert('Erreur: ' + (data.error || 'Scan non demarre'));
+                }
+            })
+            .catch(error => {
+                alert('Erreur de connexion: ' + error);
+            })
+            .finally(() => {
+                btn.disabled = false;
+                btn.textContent = 'Scanner maintenant';
+                progress.style.display = 'none';
+            });
+        }
+
+        function pollScanResult() {
+            fetch('/api/scan/status')
+                .then(response => response.json())
+                .then(status => {
+                    const scanMeta = document.getElementById('scanMeta');
+                    const scanState = document.getElementById('scanState');
+                    const currentNetwork = document.getElementById('currentNetwork');
+                    const scanProgressText = document.getElementById('scanProgressText');
+                    const scanSource = document.getElementById('scanSource');
+
+                    if (currentNetwork) {
+                        currentNetwork.textContent = status.current_network || 'en attente';
+                    }
+
+                    if (scanProgressText) {
+                        scanProgressText.textContent = `${status.completed_networks || 0}/${status.total_networks || 0}`;
+                    }
+
+                    if (scanSource) {
+                        scanSource.textContent = status.last_source || 'manual';
+                    }
+
+                    if (scanMeta) {
+                        scanMeta.innerHTML = `Réseau courant: <span id="currentNetwork">${status.current_network || 'en attente'}</span> | Progression: <span id="scanProgressText">${status.completed_networks || 0}/${status.total_networks || 0}</span> | Source: <span id="scanSource">${status.last_source || 'manual'}</span>`;
+                    }
+
+                    if (status.running) {
+                        scanState.textContent = 'En cours';
+                        setTimeout(pollScanResult, 2000);
+                        return;
+                    }
+
+                    Promise.all([
+                        fetch('/api/devices').then(response => response.json()),
+                        fetch('/api/modberries').then(response => response.json()),
+                        fetch('/api/networks').then(response => response.json())
+                    ]).then(([devices, modberries, networks]) => {
+                        renderNetworks(networks);
+                        renderDevices(devices);
+                        document.getElementById('deviceCount').textContent = devices.length;
+                        document.getElementById('modberryCount').textContent = modberries.length;
+                        document.getElementById('networkCount').textContent = networks.length;
+                        document.getElementById('countBadge').textContent = devices.length + ' hotes';
+                        document.getElementById('lastScan').textContent = new Date().toLocaleString();
+                        document.getElementById('scanState').textContent = 'Pret';
+                        document.getElementById('scanMeta').textContent = 'Scan terminé.';
+                        refreshSystemStatus();
+                    });
+                })
+                .catch(() => {
+                    setTimeout(pollScanResult, 2000);
+                });
+        }
+
+        function refreshSystemStatus() {
+            fetch('/api/system/status')
+                .then(response => response.json())
+                .then(status => {
+                    document.getElementById('autoScanState').textContent = status.auto_scan_enabled ? 'Active' : 'Desactive';
+                    document.getElementById('autoScanInterval').textContent = Math.round((status.auto_scan_interval_seconds || 7200) / 3600) + 'h';
+                    document.getElementById('nextAutoScan').textContent = status.next_auto_scan_at || 'N/A';
+                })
+                .catch(() => {});
+        }
+
+        refreshSystemStatus();
+
+        function renderNetworks(networks) {
+            const container = document.getElementById('networkList');
+            if (!networks || networks.length === 0) {
+                container.innerHTML = '<span class="small-muted">Aucun reseau detecte</span>';
+                return;
+            }
+
+            container.innerHTML = networks.map(network => `<span class="network-chip">${network}</span>`).join('');
+        }
+
+        function renderDevices(devices) {
+            const container = document.getElementById('deviceTable');
+
+            if (!devices || devices.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">LAN</div>
+                        <p>Aucun peripherique detecte</p>
+                    </div>
+                `;
+                return;
+            }
+
+            let html = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>IP</th>
+                            <th>Hostname</th>
+                            <th>Serial</th>
+                            <th>Type</th>
+                            <th>SSH</th>
+                            <th>Reseau</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+
+            devices.forEach(device => {
+                let typeBadge = 'Reachable';
+                let typeClass = 'badge-warning';
+                if (device.kind === 'modberry') {
+                    typeBadge = 'ModBerry';
+                    typeClass = 'badge-success';
+                } else if (device.kind === 'ssh-device') {
+                    typeBadge = 'SSH device';
+                    typeClass = 'badge-info';
+                }
+
+                const sshBadge = device.ssh ? '<span class="badge badge-success">Ouvert</span>' : '<span class="badge badge-warning">Ferme</span>';
+                const action = device.ssh
+                    ? `<a href="/edit_ip/${device.ip}" class="btn btn-warning btn-sm">Changer IP</a>`
+                    : '<span class="small-muted">Pas d\'SSH</span>';
+
+                html += `
+                    <tr>
+                        <td><strong>${device.ip}</strong></td>
+                        <td>${device.hostname || 'unknown'}</td>
+                        <td><code>${(device.serial || 'unknown').substring(0, 16)}...</code></td>
+                        <td><span class="badge ${typeClass}">${typeBadge}</span></td>
+                        <td>${sshBadge}</td>
+                        <td><code>${device.subnet || ''}</code></td>
+                        <td>${action}</td>
+                    </tr>
+                `;
+            });
+
+            html += `</tbody></table>`;
+            container.innerHTML = html;
+        }
+    </script>
+</body>
+</html>
