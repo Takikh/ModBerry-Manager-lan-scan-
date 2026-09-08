@@ -69,6 +69,7 @@ La colonne **ThingsBoard Edge** du dashboard donne l'état de chaque carte :
 | `Edge arrete` | Stack présente, conteneur arrêté |
 | `Non configure` | Docker et image présents, pas de `.env` |
 | `Image edge absente` | Docker présent, image custom manquante → réplication requise |
+| `Base postgres absente` | Image `postgres:16` manquante → `localhost:5432 refused` garanti |
 | `Docker absent` | Docker CE non installé |
 | `Injoignable` | SSH indisponible |
 
@@ -123,6 +124,87 @@ Bouton **Installer Docker CE sur la carte** : exécute `edge_provision.sh` en mo
 
 Le déploiement complet fait la même chose automatiquement : l'ordre des étapes place
 l'installation de Docker **avant** le transfert de l'image.
+
+---
+
+## Étape 0 ter — Base locale postgres (dépendance obligatoire)
+
+Section **Base locale postgres** → bouton **Installer / répliquer postgres**.
+
+Deuxième panne rencontrée en production. Le conteneur `tb-edge` démarrait puis mourait :
+
+```
+ERROR o.h.e.jdbc.spi.SqlExceptionHelper - Connection to localhost:5432 refused.
+Caused by: java.net.ConnectException: Connection refused
+```
+
+Deux causes cumulées :
+
+1. **L'image postgres n'était jamais arrivée.** Le script se contentait d'un
+   `docker pull postgres:16` avec un simple `AVERTISSEMENT` en cas d'échec — sur un parc
+   sans accès internet, l'image manquait silencieusement.
+2. **L'Edge avait été lancé à la main** (`docker run`), donc sans la stack compose : pas de
+   conteneur `tb-edge-postgres`, pas de `SPRING_DATASOURCE_URL`, d'où `localhost:5432`
+   au lieu de `postgres:5432`.
+
+### Ce qui a changé
+
+- **`postgres` est répliquée depuis la carte de référence** (`docker save` → `docker load`),
+  exactement comme l'image edge custom. Ordre d'essai : déjà présente → `docker pull` →
+  **réplication depuis la carte de référence**.
+- **L'absence de postgres est bloquante** : le script s'arrête avec un message explicite
+  (`exit 1`) au lieu de continuer vers un échec inévitable.
+- Le badge dashboard **`Base postgres absente`** signale le cas avant tout démarrage.
+
+---
+
+## Démarrage automatique
+
+L'Edge démarre désormais **seul**, sans `docker run` manuel.
+
+### À la fin du déploiement
+
+`docker compose up -d`, puis deux attentes actives :
+
+| Attente | Condition | Défaut |
+|---|---|---|
+| Base prête | `pg_isready -U postgres -d tb_edge` | `WAIT_DB=180` s |
+| Edge démarré | `Started ThingsBoardEdge` dans les logs | `WAIT_EDGE=300` s |
+
+Si la base ne répond pas, le script affiche **l'état et les logs de postgres** puis échoue —
+plus besoin de lire 300 lignes de stacktrace Java. Si l'edge ne confirme pas son démarrage,
+les lignes `refused` / `ERROR` / `FATAL` / `UNAUTHORIZED` sont extraites automatiquement.
+
+### Après un redémarrage de la carte
+
+`restart: always` ne suffit pas si `docker.service` n'est pas activé au boot. Le
+déploiement (option **Relancer l'Edge automatiquement au demarrage**, cochée par défaut) :
+
+- active `docker.service` et `containerd`
+- installe l'unité **`tb-edge-stack.service`** (oneshot) qui rejoue `compose up -d` au boot
+  — utile quand le SSD du data-root est monté après docker
+
+Boutons **Activer la relance au boot** / **Désactiver** pour piloter cela seul.
+
+---
+
+## Diagnostic
+
+Section **Diagnostic — pourquoi l'Edge ne tourne pas** → bouton **Diagnostiquer**.
+
+Rassemble en un appel ce qu'il fallait chercher à la main en SSH, avec le correctif
+de chaque problème :
+
+- images edge et **postgres** présentes ou non
+- tous les conteneurs, **y compris ceux lancés par `docker run`** (noms générés du type
+  `loving_lamport`) — ils tournent sans base ni `.env` et bloquent les ports
+- santé de postgres (`pg_isready`) et ses logs
+- causes d'erreur reconnues dans les logs de l'edge : `5432 refused`, `UNAUTHORIZED`,
+  serveur RPC injoignable, port déjà utilisé, `OutOfMemoryError`, disque plein
+- ports hôte occupés par un autre service, état de la relance au boot
+
+Bouton **Nettoyer les conteneurs manuels** : supprime les conteneurs edge hors stack
+(`tb-edge` et `tb-edge-postgres` ne sont jamais touchés).
 
 ---
 
@@ -186,7 +268,7 @@ Cela remplace la création manuelle via l'interface web, non tenable sur 99+ car
 | Hôte du serveur ThingsBoard | `10.0.0.1` |
 | Port RPC edge | `7071` |
 
-Le déploiement enchaîne quatre étapes dans une seule action, avec journal en direct.
+Le déploiement enchaîne cinq étapes dans une seule action, avec journal en direct.
 L'ordre est important : **Docker est installé avant que l'image ne soit transférée.**
 
 1. **Prérequis** — contrôle complet (serveur, carte de référence, cible). Un point
@@ -195,8 +277,10 @@ L'ordre est important : **Docker est installé avant que l'image ne soit transf�
    (mode `DOCKER_ONLY`). C'est ce qui évite l'échec `docker load` code 127
 3. **Image Docker custom** — `docker save` sur le maître → `docker load` sur la cible
    (ignoré si l'image est déjà présente, sauf **Forcer le retransfert**)
-4. **Stack** — écriture de `.env` (chmod 600) et `docker-compose.yml`, récupération de
-   `postgres:16`, `docker compose up -d`
+4. **Base locale postgres** — pull, ou **réplication depuis la carte de référence**.
+   Bloquant : sans elle, l'edge échoue sur `localhost:5432 refused`
+5. **Stack** — écriture de `.env` (chmod 600) et `docker-compose.yml`,
+   `docker compose up -d`, puis **attente que postgres soit prête et que l'edge démarre**
 
 Puis, en complément : **Gateway I/O** — copie de `/opt/mobilis-gateway`, installation de
 `tb-edge-io.service`. À la fin, une sonde automatique met l'état à jour.
@@ -211,6 +295,8 @@ Répertoire, projet compose, ports hôte, mot de passe Postgres, **stockage Dock
 - **Purger les volumes de donnees** — `docker compose down -v` + suppression des volumes.
   **Indispensable** sur une carte issue d'une image clonée.
 - **Forcer le retransfert** — supprime l'image existante sur la carte et la recharge
+- **Garantir la base postgres** — coché par défaut, ne pas décocher sans raison
+- **Relancer l'Edge automatiquement au demarrage** — `docker.service` + `tb-edge-stack.service`
 - **Hostname unique derive du serial** — `modberry-<8 derniers car. du serial CM5>`
 - **Installer Docker CE si absent** — dépôt officiel Debian, arch. détectée (arm64),
   exécuté **avant** le transfert de l'image
@@ -278,6 +364,11 @@ Le registre `/api/edge/assignments` liste les identités déjà affectées et em
 | `POST` | `/api/edge/<ip>/images/delete` | **Supprime une image** (arrête la stack) |
 | `POST` | `/api/edge/<ip>/images/transfer` | **Transfère / remplace l'image** (`force`) |
 | `GET` | `/api/preflight/server` | Prérequis du serveur ModBerry Manager |
+| `GET/POST` | `/api/edge/<ip>/diagnose` | **Diagnostic complet** avec correctifs |
+| `POST` | `/api/edge/<ip>/postgres/ensure` | **Garantit la base** (pull ou réplication) |
+| `POST` | `/api/edge/<ip>/cleanup` | **Supprime les conteneurs hors stack** |
+| `POST` | `/api/edge/<ip>/boot` | **Relance au boot** (activer / désactiver) |
+| `GET` | `/api/edge/<ip>/logs?container=tb-edge-postgres` | Logs de la base |
 | `POST` | `/api/edge/<ip>/deploy` | Séquence prérequis → Docker → image → stack → gateway |
 | `GET` | `/api/edge/<ip>/job?offset=N` | Logs incrémentaux |
 | `POST` | `/api/edge/<ip>/control` | `start` / `stop` / `restart` / `down` |

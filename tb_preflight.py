@@ -27,16 +27,24 @@ fixable : True si ModBerry Manager sait le corriger automatiquement
           (typiquement : installer Docker CE).
 """
 
+import re
 import shlex
 
 import paramiko
 
 from tb_edge import (
+    DEFAULT_COMPOSE_PROJECT,
+    DEFAULT_EDGE_DIR,
+    DEFAULT_EDGE_HTTP_PORT,
     DEFAULT_EDGE_IMAGE,
+    DEFAULT_EDGE_MQTT_PORT,
+    DEFAULT_PG_IMAGE,
     PROVISION_SCRIPT,
     REMOTE_SCRIPT,
     SSHSession,
 )
+
+BOOT_SERVICE = "tb-edge-stack.service"
 
 # Taille approximative de l'image edge decompressee (2.4 Go) + archive (1 Go)
 # On demande une marge confortable pour docker load (copie temporaire).
@@ -93,6 +101,7 @@ def preflight_target(
     need_image_transfer=True,
     install_docker_allowed=True,
     port=22,
+    pg_image=DEFAULT_PG_IMAGE,
 ):
     """
     Verifie qu'une carte cible est prete a recevoir le provisioning.
@@ -116,6 +125,10 @@ def preflight_target(
         "compose_available": False,
         "docker_running": False,
         "image_present": False,
+        "pg_image_present": False,
+        "stray_containers": [],
+        "boot_service_enabled": False,
+        "docker_boot_enabled": False,
         "needs_docker_install": False,
         "free_gb": None,
         "error": None,
@@ -244,6 +257,81 @@ def preflight_target(
                         hint=None
                         if image_id
                         else "Elle sera transferee depuis la carte de reference (docker save/load).",
+                    )
+                )
+
+                # image postgres : dependance DURE de la stack. Son absence
+                # provoque « Connection to localhost:5432 refused ».
+                pg_id = ssh.out(
+                    f"docker image inspect {shlex.quote(pg_image)} "
+                    "--format '{{.Id}}' 2>/dev/null || true"
+                )
+                report["pg_image_present"] = bool(pg_id)
+                checks.append(
+                    check(
+                        "pg_image",
+                        f"Base locale {pg_image}",
+                        True,
+                        level="ok" if pg_id else "warn",
+                        value="presente" if pg_id else "absente",
+                        hint=None
+                        if pg_id
+                        else "Sans cette image, tb-edge demarre puis meurt sur "
+                        "« Connection to localhost:5432 refused ». Elle sera recuperee "
+                        "du registre ou repliquee depuis la carte de reference.",
+                        fixable=True,
+                    )
+                )
+
+                # conteneurs edge lances a la main (docker run) : ils bloquent
+                # les ports et tournent sans base ni .env
+                stray = ssh.out(
+                    "docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null "
+                    "| grep -Ei 'tb-edge|thingsboard' "
+                    "| grep -vE '^(tb-edge|tb-edge-postgres)\\|' || true"
+                )
+                stray_names = [
+                    line.split("|")[0].strip()
+                    for line in (stray or "").splitlines()
+                    if line.strip()
+                ]
+                report["stray_containers"] = stray_names
+                if stray_names:
+                    checks.append(
+                        check(
+                            "stray_containers",
+                            "Conteneurs edge lances manuellement",
+                            False,
+                            level="warn",
+                            value=", ".join(stray_names[:5]),
+                            hint="Issus d'un « docker run » manuel : sans base ni .env, ils "
+                            "monopolisent les ports. Ils seront supprimes au deploiement "
+                            "(ou via « Nettoyer »).",
+                            fixable=True,
+                        )
+                    )
+
+                # relance automatique apres reboot
+                boot_enabled = ssh.out(
+                    f"systemctl is-enabled {BOOT_SERVICE} 2>/dev/null || echo absent"
+                )
+                docker_boot = ssh.out(
+                    "systemctl is-enabled docker 2>/dev/null || echo absent"
+                )
+                report["boot_service_enabled"] = "enabled" in (boot_enabled or "")
+                report["docker_boot_enabled"] = "enabled" in (docker_boot or "")
+                checks.append(
+                    check(
+                        "boot",
+                        "Relance automatique au demarrage",
+                        True,
+                        level="ok" if report["docker_boot_enabled"] else "warn",
+                        value=f"docker={docker_boot or '?'} | {BOOT_SERVICE}={boot_enabled or '?'}",
+                        hint=None
+                        if report["docker_boot_enabled"]
+                        else "docker n'est pas active au boot : apres un redemarrage de la "
+                        "carte, l'Edge ne repartira pas tout seul.",
+                        fixable=True,
                     )
                 )
 
@@ -387,6 +475,8 @@ def preflight_master(
     password,
     image=DEFAULT_EDGE_IMAGE,
     port=22,
+    pg_image=DEFAULT_PG_IMAGE,
+    need_pg=True,
 ):
     """Verifie que la carte de reference peut exporter l'image demandee."""
     report = {
@@ -400,6 +490,7 @@ def preflight_master(
         "fixable": [],
         "summary": "",
         "image_present": False,
+        "pg_image_present": False,
         "error": None,
     }
     checks = report["checks"]
@@ -439,6 +530,28 @@ def preflight_master(
                         "aucun transfert n'est possible.",
                     )
                 )
+
+                # La carte de reference est le seul recours si le registre
+                # public est inaccessible : postgres doit y etre presente.
+                if need_pg:
+                    pg_id = ssh.out(
+                        f"docker image inspect {shlex.quote(pg_image)} "
+                        "--format '{{.Id}}' 2>/dev/null || true"
+                    )
+                    report["pg_image_present"] = bool(pg_id)
+                    checks.append(
+                        check(
+                            "pg_image",
+                            f"Base locale {pg_image} (source de repli)",
+                            True,
+                            level="ok" if pg_id else "warn",
+                            value="presente" if pg_id else "absente",
+                            hint=None
+                            if pg_id
+                            else "Si la cible n'a pas d'acces au registre public, postgres ne "
+                            "pourra pas etre repliquee depuis cette carte.",
+                        )
+                    )
 
                 free_tmp = _free_gb(ssh, "/tmp")
                 enough = free_tmp is None or free_tmp >= REQUIRED_FREE_GB_MASTER
@@ -582,17 +695,13 @@ def preflight_all(
     need_image_transfer=True,
     install_docker_allowed=True,
     port=22,
+    pg_image=DEFAULT_PG_IMAGE,
 ):
     """
     Verification complete : serveur local, carte de reference (si transfert),
     puis carte cible. Retourne un rapport agrege.
     """
     reports = {"local": preflight_local(need_image_transfer=need_image_transfer)}
-
-    if need_image_transfer and str(master_ip) != str(target_ip):
-        reports["master"] = preflight_master(master_ip, user, password, image=image, port=port)
-    else:
-        reports["master"] = None
 
     reports["target"] = preflight_target(
         target_ip,
@@ -603,7 +712,22 @@ def preflight_all(
         need_image_transfer=need_image_transfer,
         install_docker_allowed=install_docker_allowed,
         port=port,
+        pg_image=pg_image,
     )
+
+    # La carte de reference est inspectee si l'image edge OU la base postgres
+    # doit en etre repliquee.
+    need_master = str(master_ip) != str(target_ip) and (
+        need_image_transfer or not reports["target"].get("pg_image_present")
+    )
+    if need_master:
+        reports["master"] = preflight_master(
+            master_ip, user, password, image=image, port=port,
+            pg_image=pg_image,
+            need_pg=not reports["target"].get("pg_image_present"),
+        )
+    else:
+        reports["master"] = None
 
     parts = [value for value in reports.values() if value]
     ok = all(part["ok"] for part in parts)
@@ -626,6 +750,449 @@ def preflight_all(
             else f"{len(blocking)} prerequis bloquant(s) - deploiement deconseille."
         ),
     }
+
+
+# ==================================================== DIAGNOSTIC COMPLET
+# Motifs d'erreur connus dans les logs de tb-edge, avec leur cause reelle et
+# le correctif. Evite de relire 300 lignes de stacktrace Java.
+LOG_SIGNATURES = [
+    (
+        r"5432 refused|Connection to localhost:5432",
+        "La base postgres n'est pas joignable",
+        "Le conteneur tb-edge-postgres est absent ou arrete, ou l'edge a ete lance "
+        "manuellement (docker run) sans la stack compose. Relancez le deploiement : "
+        "il verifie l'image postgres et attend que la base soit prete.",
+    ),
+    (
+        r"UNAUTHORIZED|Failed to establish.*credentials|routing key",
+        "Identite Edge refusee par le serveur",
+        "La Cle/Secret ne correspondent a aucun Edge du tenant, ou sont deja utilises "
+        "par une autre carte. Recreez l'Edge et redeployez.",
+    ),
+    (
+        r"Unable to connect|Connection refused.*(7070|7071)|UNAVAILABLE",
+        "Serveur ThingsBoard injoignable sur le port RPC",
+        "Verifiez l'hote et le port RPC (7071 sur ce parc, pas 7070) et que la carte "
+        "route bien vers le serveur.",
+    ),
+    (
+        r"Address already in use|port is already allocated",
+        "Un port hote est deja occupe",
+        "Un autre conteneur (souvent un « docker run » manuel) ou un service local "
+        "tient le port. Utilisez « Nettoyer les conteneurs manuels ».",
+    ),
+    (
+        r"OutOfMemoryError|Java heap space",
+        "Memoire insuffisante pour la JVM",
+        "Reduisez JAVA_OPTS (-Xmx) ou liberez de la memoire sur la carte.",
+    ),
+    (
+        r"No space left on device",
+        "Disque plein",
+        "Liberez de l'espace : supprimez les images edge obsoletes "
+        "(section « Image edge sur cette carte »).",
+    ),
+]
+
+
+def diagnose(
+    ip,
+    user,
+    password,
+    edge_dir=DEFAULT_EDGE_DIR,
+    compose_project=DEFAULT_COMPOSE_PROJECT,
+    edge_image=DEFAULT_EDGE_IMAGE,
+    pg_image=DEFAULT_PG_IMAGE,
+    edge_http_port=DEFAULT_EDGE_HTTP_PORT,
+    edge_mqtt_port=DEFAULT_EDGE_MQTT_PORT,
+    port=22,
+):
+    """
+    Diagnostic « pourquoi l'Edge ne tourne pas ».
+
+    Rassemble en un seul appel SSH tout ce qu'il fallait aller chercher a la
+    main : images, conteneurs (dont ceux lances par `docker run`), sante de
+    postgres, causes d'erreur dans les logs, ports occupes, relance au boot.
+
+    Retour dict : reachable, findings[] (level/title/detail/fix), containers,
+    images, postgres, boot, verdict.
+    """
+    report = {
+        "ip": str(ip),
+        "reachable": False,
+        "findings": [],
+        "containers": [],
+        "images": {"edge": False, "postgres": False},
+        "postgres": {"present": False, "status": None, "ready": False},
+        "edge": {"status": None, "started": False},
+        "boot": {"docker": None, "unit": None},
+        "compose_present": False,
+        "env_present": False,
+        "verdict": "",
+        "error": None,
+    }
+
+    def add(level, title, detail, fix=None):
+        report["findings"].append(
+            {"level": level, "title": title, "detail": detail, "fix": fix}
+        )
+
+    try:
+        with SSHSession(ip, user, password, port=port) as ssh:
+            report["reachable"] = True
+
+            # ------------------------------------------------------- docker
+            version = ssh.out("docker --version 2>/dev/null")
+            if "Docker version" not in (version or ""):
+                add(
+                    "fail", "Docker absent",
+                    "La commande docker est introuvable sur la carte.",
+                    "Section « Prerequis » -> « Installer Docker CE sur la carte ».",
+                )
+                report["verdict"] = "Docker n'est pas installe."
+                return report
+            report["docker_version"] = version
+
+            if ssh.run("docker info >/dev/null 2>&1", timeout=45)[0] != 0:
+                add(
+                    "fail", "Daemon Docker arrete",
+                    "docker info ne repond pas.",
+                    "systemctl start docker, puis relancez le diagnostic.",
+                )
+
+            # ------------------------------------------------------- images
+            report["images"]["edge"] = bool(
+                ssh.out(f"docker image inspect {shlex.quote(edge_image)} "
+                        "--format '{{.Id}}' 2>/dev/null || true")
+            )
+            report["images"]["postgres"] = bool(
+                ssh.out(f"docker image inspect {shlex.quote(pg_image)} "
+                        "--format '{{.Id}}' 2>/dev/null || true")
+            )
+
+            if not report["images"]["edge"]:
+                add(
+                    "fail", f"Image edge {edge_image} absente",
+                    "Le tag custom n'existe dans aucun registre public.",
+                    "Section « Image edge sur cette carte » -> « Transferer l'image manquante ».",
+                )
+            if not report["images"]["postgres"]:
+                add(
+                    "fail", f"Base locale {pg_image} absente",
+                    "C'est la cause directe de « Connection to localhost:5432 refused » : "
+                    "tb-edge demarre, ne trouve aucune base et s'arrete.",
+                    "Bouton « Installer / repliquer postgres » : pull si le registre repond, "
+                    "sinon replication depuis la carte de reference.",
+                )
+
+            # --------------------------------------------------- conteneurs
+            listing = ssh.out(
+                "docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}' 2>/dev/null"
+            )
+            for line in (listing or "").splitlines():
+                parts = line.split("|")
+                if len(parts) < 3:
+                    continue
+                report["containers"].append(
+                    {
+                        "name": parts[0].strip(),
+                        "image": parts[1].strip(),
+                        "status": parts[2].strip(),
+                        "ports": parts[3].strip() if len(parts) > 3 else "",
+                    }
+                )
+
+            names = {item["name"] for item in report["containers"]}
+            stray = [
+                item for item in report["containers"]
+                if item["name"] not in {"tb-edge", "tb-edge-postgres"}
+                and (
+                    "tb-edge" in item["image"].lower()
+                    or "thingsboard" in item["image"].lower()
+                    # docker run <image-id> : image affichee sous forme d'ID
+                    or re.fullmatch(r"[0-9a-f]{12}", item["image"].strip())
+                )
+            ]
+            if stray:
+                add(
+                    "warn", "Conteneur(s) edge lance(s) manuellement",
+                    "Detecte : "
+                    + ", ".join(f"{item['name']} ({item['status']})" for item in stray)
+                    + ". Un conteneur cree par « docker run » n'a ni base postgres ni "
+                    "variables d'environnement : il echoue systematiquement sur "
+                    "« localhost:5432 refused » et occupe les ports de la stack.",
+                    "Bouton « Nettoyer les conteneurs manuels », puis deployez depuis "
+                    "l'interface (la stack complete est demarree par docker compose).",
+                )
+            report["stray_containers"] = [item["name"] for item in stray]
+
+            # ----------------------------------------------------- postgres
+            if "tb-edge-postgres" in names:
+                report["postgres"]["present"] = True
+                report["postgres"]["status"] = next(
+                    item["status"] for item in report["containers"]
+                    if item["name"] == "tb-edge-postgres"
+                )
+                ready = ssh.run(
+                    "docker exec tb-edge-postgres pg_isready -U postgres -d tb_edge "
+                    ">/dev/null 2>&1", timeout=30
+                )[0] == 0
+                report["postgres"]["ready"] = ready
+                if not ready:
+                    add(
+                        "fail", "Postgres present mais pas pret",
+                        f"Etat du conteneur : {report['postgres']['status']}. "
+                        "pg_isready echoue.",
+                        "Consultez les logs de postgres ; un volume corrompu se corrige "
+                        "avec un redeploiement « Purger les volumes » coche.",
+                    )
+                    logs = ssh.out("docker logs --tail 30 tb-edge-postgres 2>&1")
+                    if logs:
+                        report["postgres"]["logs"] = logs[-2000:]
+            else:
+                add(
+                    "fail", "Conteneur tb-edge-postgres absent",
+                    "La stack n'a jamais demarre la base, ou l'edge a ete lance seul "
+                    "avec « docker run » au lieu de « docker compose up ».",
+                    "Relancez le deploiement depuis l'interface : il attend que la base "
+                    "soit prete avant de considerer l'edge demarre.",
+                )
+
+            # --------------------------------------------------------- edge
+            if "tb-edge" in names:
+                report["edge"]["status"] = next(
+                    item["status"] for item in report["containers"]
+                    if item["name"] == "tb-edge"
+                )
+                logs = ssh.out("docker logs --tail 400 tb-edge 2>&1", timeout=60)
+                report["edge"]["started"] = "Started ThingsBoardEdge" in (logs or "")
+
+                seen = set()
+                for pattern, title, fix in LOG_SIGNATURES:
+                    if re.search(pattern, logs or "", re.I) and title not in seen:
+                        seen.add(title)
+                        sample = next(
+                            (
+                                line.strip()
+                                for line in reversed((logs or "").splitlines())
+                                if re.search(pattern, line, re.I)
+                            ),
+                            "",
+                        )
+                        add("fail", title, sample[:300], fix)
+
+                if report["edge"]["started"] and not seen:
+                    if re.search(r"connected to cloud|edge connected", logs or "", re.I):
+                        add("ok", "Edge demarre et connecte au serveur",
+                            "L'application tourne et la liaison est etablie.")
+                    else:
+                        add("warn", "Edge demarre, liaison non confirmee",
+                            "L'application tourne mais aucun message de connexion au "
+                            "serveur n'apparait encore dans les logs.",
+                            "Patientez, puis verifiez l'etat 'Active' de l'Edge dans "
+                            "ThingsBoard.")
+            else:
+                add(
+                    "warn", "Conteneur tb-edge absent",
+                    "Aucun conteneur tb-edge n'existe sur la carte.",
+                    "Lancez le deploiement depuis la section « 3. Deploiement ».",
+                )
+
+            # -------------------------------------------- fichiers de config
+            report["compose_present"] = bool(
+                ssh.out(f"test -f {shlex.quote(edge_dir)}/docker-compose.yml "
+                        "&& echo yes || true")
+            )
+            report["env_present"] = bool(
+                ssh.out(f"test -f {shlex.quote(edge_dir)}/.env && echo yes || true")
+            )
+            if not report["compose_present"] or not report["env_present"]:
+                add(
+                    "warn", "Configuration de la stack incomplete",
+                    f"docker-compose.yml: {'ok' if report['compose_present'] else 'absent'} | "
+                    f".env: {'ok' if report['env_present'] else 'absent'} dans {edge_dir}.",
+                    "Le deploiement (re)ecrit ces deux fichiers.",
+                )
+
+            # ---------------------------------------------- ports et boot
+            for label, value in (("HTTP", edge_http_port), ("MQTT", edge_mqtt_port)):
+                holder = ssh.out(
+                    f"ss -ltnp 2>/dev/null | grep -w ':{int(value)}' | head -1"
+                )
+                if holder and "docker" not in holder.lower():
+                    add(
+                        "warn", f"Port {label} {value} occupe par un autre service",
+                        holder[:200],
+                        f"Changez le port hote {label} dans les options avancees, ou "
+                        "liberez le port.",
+                    )
+
+            docker_boot = ssh.out("systemctl is-enabled docker 2>/dev/null || echo absent")
+            unit_boot = ssh.out(
+                f"systemctl is-enabled {BOOT_SERVICE} 2>/dev/null || echo absent"
+            )
+            report["boot"]["docker"] = docker_boot
+            report["boot"]["unit"] = unit_boot
+            if "enabled" not in (docker_boot or ""):
+                add(
+                    "warn", "Docker n'est pas active au demarrage",
+                    f"systemctl is-enabled docker = {docker_boot}.",
+                    "Bouton « Activer la relance au boot » : sinon l'Edge ne repart pas "
+                    "apres un redemarrage de la carte.",
+                )
+
+            # ------------------------------------------------------ verdict
+            fails = [f for f in report["findings"] if f["level"] == "fail"]
+            warns = [f for f in report["findings"] if f["level"] == "warn"]
+            if report["edge"]["started"] and not fails:
+                report["verdict"] = "Edge operationnel."
+            elif fails:
+                report["verdict"] = f"{len(fails)} probleme(s) bloquant(s) : " + "; ".join(
+                    f["title"] for f in fails[:3]
+                )
+            elif warns:
+                report["verdict"] = f"{len(warns)} point(s) d'attention."
+            else:
+                report["verdict"] = "Aucun probleme detecte."
+
+    except Exception as exception:
+        report["error"] = f"SSH indisponible: {exception}"
+        report["verdict"] = report["error"]
+
+    return report
+
+
+def cleanup_stray_containers(ip, user, password, edge_image=DEFAULT_EDGE_IMAGE, port=22):
+    """
+    Supprime les conteneurs edge crees hors de la stack compose.
+
+    Cible les noms generes par Docker (« loving_lamport »...) issus d'un
+    `docker run` manuel : sans postgres ni `.env`, ils echouent toujours et
+    bloquent les ports 8082/1884.
+    Retour (ok, message, removed[]).
+    """
+    removed = []
+    try:
+        with SSHSession(ip, user, password, port=port) as ssh:
+            sudo = "" if (ssh.out("id -u") or "").strip() == "0" else "sudo -n "
+
+            listing = ssh.out(
+                "docker ps -a --format '{{.Names}}|{{.Image}}' 2>/dev/null"
+            )
+            candidates = []
+            for line in (listing or "").splitlines():
+                if "|" not in line:
+                    continue
+                name, _, image = line.partition("|")
+                name, image = name.strip(), image.strip()
+                if name in {"tb-edge", "tb-edge-postgres"} or not name:
+                    continue
+                if (
+                    "tb-edge" in image.lower()
+                    or "thingsboard" in image.lower()
+                    or re.fullmatch(r"[0-9a-f]{12}", image)
+                ):
+                    candidates.append(name)
+
+            for name in candidates:
+                rc, _, _ = ssh.run(f"{sudo}docker rm -f {shlex.quote(name)}", timeout=120)
+                if rc == 0:
+                    removed.append(name)
+
+            if not candidates:
+                return True, "Aucun conteneur edge lance manuellement.", []
+            if not removed:
+                return False, f"Suppression echouee pour : {', '.join(candidates)}", []
+            return True, (
+                f"{len(removed)} conteneur(s) supprime(s) : {', '.join(removed)}. "
+                "Les ports de la stack sont liberes."
+            ), removed
+    except Exception as exception:
+        return False, f"Erreur SSH: {exception}", removed
+
+
+BOOT_UNIT_TEMPLATE = """[Unit]
+Description=ThingsBoard Edge stack (docker compose) - ModBerry Manager
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={edge_dir}
+ExecStart=/usr/bin/env {compose} -p {project} up -d
+ExecStop=/usr/bin/env {compose} -p {project} stop
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def set_boot_persistence(
+    ip,
+    user,
+    password,
+    enable=True,
+    edge_dir=DEFAULT_EDGE_DIR,
+    compose_project=DEFAULT_COMPOSE_PROJECT,
+    port=22,
+):
+    """
+    Active (ou desactive) la relance automatique de la stack au demarrage.
+
+    `restart: always` ne suffit pas si docker.service n'est pas active au
+    boot : la carte redemarre et l'Edge ne revient jamais. On active donc
+    docker **et** une unite oneshot qui rejoue `compose up -d`.
+    Retour (ok, message).
+    """
+    try:
+        with SSHSession(ip, user, password, port=port) as ssh:
+            sudo = "" if (ssh.out("id -u") or "").strip() == "0" else "sudo -n "
+
+            if not enable:
+                ssh.run(f"{sudo}systemctl disable {BOOT_SERVICE}", timeout=60)
+                return True, (
+                    f"{BOOT_SERVICE} desactive. La stack ne sera plus relancee au boot "
+                    "(docker.service reste inchange)."
+                )
+
+            compose = "docker compose"
+            if not ssh.out("docker compose version --short 2>/dev/null"):
+                if ssh.out("command -v docker-compose 2>/dev/null"):
+                    compose = "docker-compose"
+                else:
+                    return False, "Aucun docker compose disponible sur la carte."
+
+            ssh.run(f"{sudo}systemctl enable docker", timeout=60)
+            ssh.run(f"{sudo}systemctl enable containerd", timeout=60)
+
+            unit = BOOT_UNIT_TEMPLATE.format(
+                edge_dir=edge_dir, compose=compose, project=compose_project
+            )
+            rc, _, err = ssh.run(
+                f"{sudo}tee /etc/systemd/system/{BOOT_SERVICE} >/dev/null "
+                f"<<'UNIT_EOF'\n{unit}UNIT_EOF",
+                timeout=45,
+            )
+            if rc != 0:
+                return False, f"Ecriture de l'unite impossible: {err}"
+
+            ssh.run(f"{sudo}systemctl daemon-reload", timeout=60)
+            rc, _, err = ssh.run(f"{sudo}systemctl enable {BOOT_SERVICE}", timeout=60)
+            if rc != 0:
+                return False, f"Activation de {BOOT_SERVICE} echouee: {err}"
+
+            docker_state = ssh.out("systemctl is-enabled docker 2>/dev/null")
+            unit_state = ssh.out(f"systemctl is-enabled {BOOT_SERVICE} 2>/dev/null")
+            return True, (
+                f"Relance au boot activee (docker={docker_state or '?'}, "
+                f"{BOOT_SERVICE}={unit_state or '?'}). "
+                "L'Edge repartira automatiquement apres un redemarrage."
+            )
+    except Exception as exception:
+        return False, f"Erreur SSH: {exception}"
 
 
 # ============================================ INSTALLATION DOCKER SEULE

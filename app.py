@@ -68,6 +68,12 @@ DEFAULT_EDGE_SETTINGS = {
     "start_edge": True,
     "transfer_image": True,
     "force_image_transfer": False,
+    # Base locale de l'edge : sans elle, tb-edge meurt sur
+    # « Connection to localhost:5432 refused ».
+    "pg_image": tb_edge.DEFAULT_PG_IMAGE,
+    "transfer_postgres": True,
+    # Relance automatique de la stack apres un reboot de la carte.
+    "enable_on_boot": True,
     "transfer_gateway": True,
     "install_gateway_service": True,
     "enable_gateway_service": False,  # bug GPIO a corriger avant demarrage
@@ -905,6 +911,7 @@ def api_edge_preflight(ip):
         payload.get("master_ip") or settings.get("master_ip") or tb_master.DEFAULT_MASTER_IP
     ).strip()
     image = (payload.get("edge_image") or settings.get("edge_image") or tb_edge.DEFAULT_EDGE_IMAGE).strip()
+    pg_image = (payload.get("pg_image") or settings.get("pg_image") or tb_edge.DEFAULT_PG_IMAGE).strip()
     edge_dir = (payload.get("edge_dir") or settings.get("edge_dir") or tb_edge.DEFAULT_EDGE_DIR).strip()
     need_image = parse_bool(payload.get("transfer_image", settings.get("transfer_image", True)))
     install_docker_allowed = parse_bool(
@@ -921,6 +928,7 @@ def api_edge_preflight(ip):
         user,
         password,
         image=image,
+        pg_image=pg_image,
         edge_dir=edge_dir,
         need_image_transfer=need_image,
         install_docker_allowed=install_docker_allowed,
@@ -1130,6 +1138,106 @@ def api_edge_image_transfer(ip):
     return jsonify({"success": True, "started": True, "running": True, "job": job.snapshot(0)}), 202
 
 
+@app.route("/api/edge/<ip>/postgres/ensure", methods=["POST"])
+@login_required
+def api_edge_postgres_ensure(ip):
+    """
+    Garantit la presence de l'image postgres sur la carte.
+
+    Pull si le registre repond, sinon replication depuis la carte de reference.
+    Sans cette image, tb-edge demarre puis meurt sur
+    « Connection to localhost:5432 refused ».
+    """
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    settings = get_edge_settings()
+    master_ip = (payload.get("master_ip") or settings.get("master_ip") or tb_master.DEFAULT_MASTER_IP).strip()
+    image = (payload.get("pg_image") or settings.get("pg_image") or tb_edge.DEFAULT_PG_IMAGE).strip()
+    allow_pull = parse_bool(payload.get("pull_images", settings.get("pull_images", True)))
+
+    user, password = ssh_credentials()
+
+    def target(job):
+        job.log(f"=== Base locale postgres sur {ip} ===")
+        job.log(f"Image : {image} | pull autorise : {allow_pull} | reference : {master_ip}")
+        return tb_master.ensure_postgres_image(
+            master_ip, ip, user, password,
+            image=image, on_line=job.log, allow_pull=allow_pull,
+        )
+
+    started, job = job_manager.start(
+        f"deploy:{ip}", f"Postgres {ip}", target,
+        meta={"ip": ip, "kind": "postgres", "image": image},
+    )
+    if not started:
+        return jsonify(
+            {"success": True, "started": False, "running": True, "job": job.snapshot(0),
+             "message": "Une operation est deja en cours sur cette carte."}
+        ), 202
+
+    return jsonify({"success": True, "started": True, "running": True, "job": job.snapshot(0)}), 202
+
+
+@app.route("/api/edge/<ip>/diagnose", methods=["GET", "POST"])
+@login_required
+def api_edge_diagnose(ip):
+    """
+    Diagnostic complet d'une carte : pourquoi l'Edge ne tourne pas.
+
+    Regroupe en un appel ce qu'il fallait aller chercher a la main en SSH :
+    images presentes, conteneurs (y compris ceux lances manuellement),
+    sante de postgres, causes d'erreur dans les logs, conflits de ports,
+    relance au boot. Chaque probleme est accompagne du correctif.
+    """
+    settings = get_edge_settings()
+    user, password = ssh_credentials()
+    report = tb_preflight.diagnose(
+        ip, user, password,
+        edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR),
+        compose_project=settings.get("compose_project", tb_edge.DEFAULT_COMPOSE_PROJECT),
+        edge_image=settings.get("edge_image", tb_edge.DEFAULT_EDGE_IMAGE),
+        pg_image=settings.get("pg_image", tb_edge.DEFAULT_PG_IMAGE),
+        edge_http_port=settings.get("edge_http_port", tb_edge.DEFAULT_EDGE_HTTP_PORT),
+        edge_mqtt_port=settings.get("edge_mqtt_port", tb_edge.DEFAULT_EDGE_MQTT_PORT),
+    )
+    return jsonify({"success": True, "diagnose": report})
+
+
+@app.route("/api/edge/<ip>/cleanup", methods=["POST"])
+@login_required
+def api_edge_cleanup(ip):
+    """
+    Supprime les conteneurs edge lances manuellement (`docker run`).
+
+    Ces conteneurs portent un nom genere (ex. « loving_lamport »), n'ont ni
+    base ni variables d'environnement, et bloquent les ports de la stack.
+    """
+    user, password = ssh_credentials()
+    settings = get_edge_settings()
+    ok, message, removed = tb_preflight.cleanup_stray_containers(
+        ip, user, password,
+        edge_image=settings.get("edge_image", tb_edge.DEFAULT_EDGE_IMAGE),
+    )
+    return jsonify({"success": ok, "message": message, "removed": removed}), (200 if ok else 500)
+
+
+@app.route("/api/edge/<ip>/boot", methods=["POST"])
+@login_required
+def api_edge_boot(ip):
+    """Active ou desactive la relance automatique de la stack au demarrage."""
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    enable = parse_bool(payload.get("enable", True))
+    settings = get_edge_settings()
+    user, password = ssh_credentials()
+
+    ok, message = tb_preflight.set_boot_persistence(
+        ip, user, password,
+        enable=enable,
+        edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR),
+        compose_project=settings.get("compose_project", tb_edge.DEFAULT_COMPOSE_PROJECT),
+    )
+    return jsonify({"success": ok, "message": message}), (200 if ok else 500)
+
+
 @app.route("/api/edge/<ip>/deploy", methods=["POST"])
 @login_required
 def api_edge_deploy(ip):
@@ -1150,6 +1258,8 @@ def api_edge_deploy(ip):
         "edge_mqtt_port": parse_int(payload.get("edge_mqtt_port"), settings.get("edge_mqtt_port", tb_edge.DEFAULT_EDGE_MQTT_PORT)),
         "edge_name": (payload.get("edge_name") or "").strip(),
         "pg_password": (payload.get("pg_password") or "postgres").strip(),
+        "pg_image": (payload.get("pg_image") or settings.get("pg_image") or tb_edge.DEFAULT_PG_IMAGE).strip(),
+        "enable_on_boot": parse_bool(payload.get("enable_on_boot", settings.get("enable_on_boot", True))),
         "docker_data_root": (payload.get("docker_data_root") or settings.get("docker_data_root") or "").strip(),
         "reset_data": parse_bool(payload.get("reset_data", True)),
         "set_hostname": parse_bool(payload.get("set_hostname", settings.get("set_hostname", True))),
@@ -1167,6 +1277,7 @@ def api_edge_deploy(ip):
     enable_gateway_service = parse_bool(payload.get("enable_gateway_service", False))
     force_image_transfer = parse_bool(payload.get("force_image_transfer", settings.get("force_image_transfer", False)))
     do_preflight = parse_bool(payload.get("preflight_check", settings.get("preflight_check", True)))
+    do_transfer_postgres = parse_bool(payload.get("transfer_postgres", settings.get("transfer_postgres", True)))
 
     valid, error = tb_edge.validate_edge_key(options["edge_key"])
     if not valid:
@@ -1207,6 +1318,9 @@ def api_edge_deploy(ip):
             "master_ip": master_ip,
             "preflight_check": do_preflight,
             "force_image_transfer": force_image_transfer,
+            "pg_image": options["pg_image"],
+            "transfer_postgres": do_transfer_postgres,
+            "enable_on_boot": options["enable_on_boot"],
         }
     )
 
@@ -1222,12 +1336,14 @@ def api_edge_deploy(ip):
         job.log(f"Image edge         : {options['edge_image']}")
         job.log(f"Projet compose     : {options['compose_project']} dans {options['edge_dir']}")
         job.log(f"Ports hote         : HTTP {options['edge_http_port']} | MQTT {options['edge_mqtt_port']}")
+        job.log(f"Base locale        : {options['pg_image']}")
         job.log(f"Reset volumes      : {options['reset_data']} | Hostname unique: {options['set_hostname']}")
         job.log(f"Prerequis verifies : {do_preflight} | Retransfert force: {force_image_transfer}")
+        job.log(f"Relance au boot    : {options['enable_on_boot']}")
 
         # ---- Etape 1 : verification des prerequis (avant toute operation longue)
         job.log("")
-        job.log("--- Etape 1/4 : verification des prerequis ---")
+        job.log("--- Etape 1/5 : verification des prerequis ---")
         if do_preflight:
             report = tb_preflight.preflight_all(
                 ip,
@@ -1235,6 +1351,7 @@ def api_edge_deploy(ip):
                 user,
                 password,
                 image=options["edge_image"],
+                pg_image=options["pg_image"],
                 edge_dir=options["edge_dir"],
                 need_image_transfer=do_transfer_image,
                 install_docker_allowed=options["install_docker"],
@@ -1263,7 +1380,7 @@ def api_edge_deploy(ip):
         # ---- Etape 2 : Docker doit exister AVANT le transfert de l'image.
         # Sans cela, on pousse 1 Go pour finir sur « docker: command not found ».
         job.log("")
-        job.log("--- Etape 2/4 : dependances Docker sur la cible ---")
+        job.log("--- Etape 2/5 : dependances Docker sur la cible ---")
         docker_ready = tb_preflight.preflight_target(
             ip,
             user,
@@ -1293,7 +1410,7 @@ def api_edge_deploy(ip):
         # ---- Etape 3 : image Docker custom (absente des registres publics)
         if do_transfer_image:
             job.log("")
-            job.log("--- Etape 3/4 : image Docker custom ---")
+            job.log("--- Etape 3/5 : image Docker custom ---")
             ok, message = tb_master.transfer_edge_image(
                 master_ip, ip, user, password,
                 image=options["edge_image"], on_line=job.log,
@@ -1304,11 +1421,32 @@ def api_edge_deploy(ip):
                 return False, f"Transfert de l'image interrompu: {message}"
         else:
             job.log("")
-            job.log("--- Etape 3/4 : transfert d'image ignore ---")
+            job.log("--- Etape 3/5 : transfert d'image ignore ---")
 
-        # ---- Etape 4 : compose + demarrage
+        # ---- Etape 4 : base locale postgres (dependance DURE de l'edge)
+        # Sans elle, tb-edge demarre puis meurt sur
+        #   Connection to localhost:5432 refused
         job.log("")
-        job.log("--- Etape 4/4 : provisioning de la stack ---")
+        job.log("--- Etape 4/5 : base locale postgres ---")
+        if do_transfer_postgres:
+            ok, message = tb_master.ensure_postgres_image(
+                master_ip, ip, user, password,
+                image=options["pg_image"], on_line=job.log,
+                allow_pull=options["pull_images"],
+            )
+            job.log(message)
+            if not ok:
+                return False, f"Base locale indisponible: {message}"
+        else:
+            job.log("Etape ignoree (option decochee).")
+            job.log(
+                "ATTENTION: si postgres est absent de la carte, tb-edge echouera sur "
+                "« Connection to localhost:5432 refused »."
+            )
+
+        # ---- Etape 5 : compose + demarrage (attente de postgres puis tb-edge)
+        job.log("")
+        job.log("--- Etape 5/5 : provisioning et demarrage de la stack ---")
         ok, message = tb_edge.deploy_edge(ip, user, password, options, job.log)
 
         if ok:
@@ -1419,11 +1557,14 @@ def api_edge_control(ip):
 @app.route("/api/edge/<ip>/logs")
 @login_required
 def api_edge_logs(ip):
-    """Recupere les logs du conteneur tb-edge."""
+    """Recupere les logs d'un conteneur de la stack (tb-edge par defaut)."""
     lines = parse_int(request.args.get("lines"), 200)
-    settings = get_edge_settings()
+    container = (request.args.get("container") or "tb-edge").strip()
+    if container not in {"tb-edge", "tb-edge-postgres"}:
+        return jsonify({"success": False, "error": f"Conteneur inconnu: {container}"}), 400
+
     user, password = ssh_credentials()
-    ok, output = tb_edge.fetch_edge_logs(ip, user, password, lines=lines)
+    ok, output = tb_edge.fetch_edge_logs(ip, user, password, lines=lines, container=container)
     return jsonify({"success": ok, "logs": output}), (200 if ok else 500)
 
 
