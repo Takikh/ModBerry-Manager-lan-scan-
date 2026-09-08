@@ -114,6 +114,7 @@
                             <th>Serial</th>
                             <th>Type</th>
                             <th>SSH</th>
+                            <th>ThingsBoard Edge</th>
                             <th>Reseau</th>
                             <th>Actions</th>
                         </tr>
@@ -140,10 +141,30 @@
                                     <span class="badge badge-warning">Ferme</span>
                                 {% endif %}
                             </td>
+                            <td>
+                                {% if device.edge_status == 'connected' %}
+                                    <span class="badge badge-success">Connecte au serveur</span>
+                                {% elif device.edge_status == 'starting' %}
+                                    <span class="badge badge-info">Demarrage / non connecte</span>
+                                {% elif device.edge_status == 'stopped' %}
+                                    <span class="badge badge-danger">Edge arrete</span>
+                                {% elif device.edge_status == 'not_configured' %}
+                                    <span class="badge badge-warning">Non configure</span>
+                                {% elif device.edge_status == 'not_installed' %}
+                                    <span class="badge badge-warning">Docker absent</span>
+                                {% elif device.tb_edge and device.tb_edge.startswith('Up') %}
+                                    <span class="badge badge-info">{{ device.tb_edge }}</span>
+                                {% else %}
+                                    <span class="small-muted">non verifie</span>
+                                {% endif %}
+                            </td>
                             <td><code>{{ device.subnet }}</code></td>
                             <td>
                                 {% if device.ssh %}
-                                    <a href="{{ url_for('edit_ip', ip=device.ip) }}" class="btn btn-warning btn-sm">Changer IP</a>
+                                    <div class="edge-actions">
+                                        <a href="{{ url_for('edge_page', ip=device.ip) }}" class="btn btn-primary btn-sm">Configurer Edge</a>
+                                        <a href="{{ url_for('edit_ip', ip=device.ip) }}" class="btn btn-warning btn-sm">Changer IP</a>
+                                    </div>
                                 {% else %}
                                     <span class="small-muted">Pas d'SSH</span>
                                 {% endif %}
@@ -279,6 +300,26 @@
             container.innerHTML = networks.map(network => `<span class="network-chip">${network}</span>`).join('');
         }
 
+        const EDGE_BADGES = {
+            connected:      ['Connecte au serveur', 'badge-success'],
+            starting:       ['Demarrage / non connecte', 'badge-info'],
+            stopped:        ['Edge arrete', 'badge-danger'],
+            not_configured: ['Non configure', 'badge-warning'],
+            not_installed:  ['Docker absent', 'badge-warning'],
+            error:          ['Injoignable', 'badge-danger']
+        };
+
+        function edgeBadge(device) {
+            const entry = EDGE_BADGES[device.edge_status];
+            if (entry) {
+                return `<span class="badge ${entry[1]}">${entry[0]}</span>`;
+            }
+            if (device.tb_edge && device.tb_edge.startsWith('Up')) {
+                return `<span class="badge badge-info">${device.tb_edge}</span>`;
+            }
+            return '<span class="small-muted">non verifie</span>';
+        }
+
         function renderDevices(devices) {
             const container = document.getElementById('deviceTable');
 
@@ -301,6 +342,7 @@
                             <th>Serial</th>
                             <th>Type</th>
                             <th>SSH</th>
+                            <th>ThingsBoard Edge</th>
                             <th>Reseau</th>
                             <th>Actions</th>
                         </tr>
@@ -321,7 +363,10 @@
 
                 const sshBadge = device.ssh ? '<span class="badge badge-success">Ouvert</span>' : '<span class="badge badge-warning">Ferme</span>';
                 const action = device.ssh
-                    ? `<a href="/edit_ip/${device.ip}" class="btn btn-warning btn-sm">Changer IP</a>`
+                    ? `<div class="edge-actions">
+                           <a href="/edge/${device.ip}" class="btn btn-primary btn-sm">Configurer Edge</a>
+                           <a href="/edit_ip/${device.ip}" class="btn btn-warning btn-sm">Changer IP</a>
+                       </div>`
                     : '<span class="small-muted">Pas d\'SSH</span>';
 
                 html += `
@@ -331,6 +376,7 @@
                         <td><code>${(device.serial || 'unknown').substring(0, 16)}...</code></td>
                         <td><span class="badge ${typeClass}">${typeBadge}</span></td>
                         <td>${sshBadge}</td>
+                        <td>${edgeBadge(device)}</td>
                         <td><code>${device.subnet || ''}</code></td>
                         <td>${action}</td>
                     </tr>

@@ -94,7 +94,7 @@
       "ip": "10.0.0.26",
       "hostname": "techbase",
       "serial": "9057cf1e146ee0b1\u0000",
-      "tb_edge": "Up 9 minutes",
+      "tb_edge": "not installed",
       "subnet": "10.0.0.0/24",
       "online": true,
       "ssh": true,
@@ -266,7 +266,7 @@
       "ip": "10.0.0.26",
       "hostname": "techbase",
       "serial": "9057cf1e146ee0b1\u0000",
-      "tb_edge": "Up 9 minutes",
+      "tb_edge": "not installed",
       "subnet": "10.0.0.0/24",
       "online": true,
       "ssh": true,
@@ -283,5 +283,22 @@
     "192.168.4.0/24",
     "192.168.0.0/20"
   ],
-  "last_scan": "2026-09-08T12:50:11.647485"
+  "last_scan": "2026-09-08T12:50:11.647485",
+  "edge_states": {},
+  "edge_settings": {
+    "cloud_host": "",
+    "cloud_port": 7070,
+    "cloud_ssl": false,
+    "cloud_web_url": "",
+    "edge_version": "4.0.0EDGE",
+    "edge_dir": "/opt/tb-edge",
+    "edge_http_port": 8080,
+    "edge_mqtt_port": 1883,
+    "hostname_prefix": "modberry",
+    "install_docker": true,
+    "reset_data": true,
+    "set_hostname": true,
+    "pull_images": true,
+    "start_edge": true
+  }
 }

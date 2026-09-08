@@ -18,6 +18,10 @@ from functools import wraps
 import paramiko
 from flask import Flask, flash, jsonify, redirect, render_template, request, session, url_for
 
+import tb_edge
+from jobs import manager as job_manager
+from tb_cloud import ThingsBoardClient, ThingsBoardError
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
@@ -33,6 +37,23 @@ AUTO_SCAN_INTERVAL_SECONDS = int(os.environ.get("MODBERRY_AUTO_SCAN_INTERVAL_SEC
 DEFAULT_WEB_IDENTITY = os.environ.get("MODBERRY_WEB_IDENTITY", "admin-ip")
 DEFAULT_WEB_EMAIL = os.environ.get("MODBERRY_WEB_EMAIL", "admin-ip@modberry.local")
 DEFAULT_WEB_PASSWORD = os.environ.get("MODBERRY_WEB_PASSWORD", "takieddine")
+
+DEFAULT_EDGE_SETTINGS = {
+    "cloud_host": os.environ.get("MODBERRY_TB_HOST", ""),
+    "cloud_port": int(os.environ.get("MODBERRY_TB_RPC_PORT", "7070")),
+    "cloud_ssl": False,
+    "cloud_web_url": os.environ.get("MODBERRY_TB_URL", ""),
+    "edge_version": tb_edge.DEFAULT_EDGE_VERSION,
+    "edge_dir": tb_edge.DEFAULT_EDGE_DIR,
+    "edge_http_port": tb_edge.DEFAULT_EDGE_HTTP_PORT,
+    "edge_mqtt_port": 1883,
+    "hostname_prefix": "modberry",
+    "install_docker": True,
+    "reset_data": True,
+    "set_hostname": True,
+    "pull_images": True,
+    "start_edge": True,
+}
 
 scan_lock = threading.Lock()
 scan_scheduler_started = False
@@ -68,6 +89,8 @@ def load_config():
         "modberries": [],
         "networks": [],
         "last_scan": None,
+        "edge_settings": dict(DEFAULT_EDGE_SETTINGS),
+        "edge_states": {},
     }
 
     if os.path.exists(CONFIG_FILE):
@@ -79,6 +102,11 @@ def load_config():
         config.setdefault("modberries", [])
         config.setdefault("networks", [])
         config.setdefault("last_scan", None)
+        config.setdefault("edge_states", {})
+
+        edge_settings = config.setdefault("edge_settings", {})
+        for key, value in DEFAULT_EDGE_SETTINGS.items():
+            edge_settings.setdefault(key, value)
 
         if DEFAULT_WEB_IDENTITY not in config["users"]:
             config["users"][DEFAULT_WEB_IDENTITY] = {
@@ -670,6 +698,411 @@ def api_export():
             "users": list(config.get("users", {}).keys()),
         }
     )
+
+
+# =============================================================================
+#  THINGSBOARD EDGE - configuration, provisioning et supervision
+# =============================================================================
+
+
+def get_edge_settings():
+    return load_config().get("edge_settings", dict(DEFAULT_EDGE_SETTINGS))
+
+
+def save_edge_settings(updates):
+    config = load_config()
+    settings = config.setdefault("edge_settings", dict(DEFAULT_EDGE_SETTINGS))
+    settings.update(updates)
+    save_config(config)
+    return settings
+
+
+def find_device(ip):
+    config = load_config()
+    for bucket in ("devices", "modberries"):
+        for device in config.get(bucket, []):
+            if device.get("ip") == ip:
+                return device
+    return None
+
+
+def store_edge_state(ip, state):
+    """Persiste l'etat Edge d'une carte et met a jour la colonne tb_edge."""
+    config = load_config()
+    config.setdefault("edge_states", {})[ip] = state
+
+    summary = state.get("container_status") or tb_edge.status_label(state.get("status"))[0]
+    for bucket in ("devices", "modberries"):
+        for device in config.get(bucket, []):
+            if device.get("ip") == ip:
+                device["tb_edge"] = summary
+                device["edge_status"] = state.get("status")
+                device["edge_key"] = state.get("edge_key")
+                device["edge_connected"] = state.get("cloud_connected")
+
+    save_config(config)
+    return state
+
+
+def ssh_credentials():
+    return SSH_USER, SSH_PASSWORD
+
+
+def parse_bool(value):
+    return str(value).strip().lower() in {"1", "true", "on", "yes", "oui"}
+
+
+def parse_int(value, default):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+@app.route("/edge/<ip>")
+@login_required
+def edge_page(ip):
+    """Page de configuration ThingsBoard Edge pour une carte."""
+    device = find_device(ip)
+    if not device:
+        flash("Peripherique non trouve. Relancez un scan.", "error")
+        return redirect(url_for("dashboard"))
+
+    config = load_config()
+    settings = config.get("edge_settings", dict(DEFAULT_EDGE_SETTINGS))
+    state = config.get("edge_states", {}).get(ip)
+    job = job_manager.snapshot(f"deploy:{ip}")
+
+    return render_template(
+        "edge.html",
+        device=device,
+        settings=settings,
+        state=state,
+        status_label=tb_edge.status_label,
+        job=job,
+        default_edge_version=tb_edge.DEFAULT_EDGE_VERSION,
+    )
+
+
+@app.route("/api/edge/<ip>/probe", methods=["POST", "GET"])
+@login_required
+def api_edge_probe(ip):
+    """Inspecte l'etat de ThingsBoard Edge sur la carte."""
+    settings = get_edge_settings()
+    user, password = ssh_credentials()
+    state = tb_edge.probe_edge(
+        ip,
+        user,
+        password,
+        edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR),
+    )
+    store_edge_state(ip, state)
+
+    label, css_class = tb_edge.status_label(state.get("status"))
+    return jsonify({"success": True, "state": state, "label": label, "css_class": css_class})
+
+
+@app.route("/api/edge/<ip>/deploy", methods=["POST"])
+@login_required
+def api_edge_deploy(ip):
+    """Deploie / reconfigure ThingsBoard Edge sur la carte (tache longue)."""
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    settings = get_edge_settings()
+
+    options = {
+        "edge_key": (payload.get("edge_key") or "").strip(),
+        "edge_secret": (payload.get("edge_secret") or "").strip(),
+        "cloud_host": (payload.get("cloud_host") or settings.get("cloud_host") or "").strip(),
+        "cloud_port": parse_int(payload.get("cloud_port"), settings.get("cloud_port", 7070)),
+        "cloud_ssl": parse_bool(payload.get("cloud_ssl", settings.get("cloud_ssl", False))),
+        "edge_version": (payload.get("edge_version") or settings.get("edge_version") or tb_edge.DEFAULT_EDGE_VERSION).strip(),
+        "edge_dir": (payload.get("edge_dir") or settings.get("edge_dir") or tb_edge.DEFAULT_EDGE_DIR).strip(),
+        "edge_http_port": parse_int(payload.get("edge_http_port"), settings.get("edge_http_port", 8080)),
+        "edge_mqtt_port": parse_int(payload.get("edge_mqtt_port"), settings.get("edge_mqtt_port", 1883)),
+        "edge_name": (payload.get("edge_name") or "").strip(),
+        "pg_password": (payload.get("pg_password") or "postgres").strip(),
+        "reset_data": parse_bool(payload.get("reset_data", True)),
+        "set_hostname": parse_bool(payload.get("set_hostname", settings.get("set_hostname", True))),
+        "hostname_prefix": (payload.get("hostname_prefix") or settings.get("hostname_prefix") or "modberry").strip(),
+        "install_docker": parse_bool(payload.get("install_docker", settings.get("install_docker", True))),
+        "pull_images": parse_bool(payload.get("pull_images", True)),
+        "start_edge": parse_bool(payload.get("start_edge", True)),
+    }
+
+    valid, error = tb_edge.validate_edge_key(options["edge_key"])
+    if not valid:
+        return jsonify({"success": False, "error": error}), 400
+    valid, error = tb_edge.validate_edge_secret(options["edge_secret"])
+    if not valid:
+        return jsonify({"success": False, "error": error}), 400
+    valid, error = tb_edge.validate_host(options["cloud_host"])
+    if not valid:
+        return jsonify({"success": False, "error": error}), 400
+
+    # Memorise les reglages reutilisables (jamais la cle/secret specifiques)
+    save_edge_settings(
+        {
+            "cloud_host": options["cloud_host"],
+            "cloud_port": options["cloud_port"],
+            "cloud_ssl": options["cloud_ssl"],
+            "edge_version": options["edge_version"],
+            "edge_dir": options["edge_dir"],
+            "edge_http_port": options["edge_http_port"],
+            "edge_mqtt_port": options["edge_mqtt_port"],
+            "hostname_prefix": options["hostname_prefix"],
+            "install_docker": options["install_docker"],
+            "set_hostname": options["set_hostname"],
+        }
+    )
+
+    user, password = ssh_credentials()
+    job_key = f"deploy:{ip}"
+
+    def target(job):
+        job.log(f"Deploiement ThingsBoard Edge sur {ip}")
+        job.log(f"Serveur cible  : {options['cloud_host']}:{options['cloud_port']} (ssl={options['cloud_ssl']})")
+        job.log(f"Cle Edge       : {options['edge_key']}")
+        job.log(f"Secret Edge    : {tb_edge.mask_secret(options['edge_secret'])}")
+        job.log(f"Version Edge   : {options['edge_version']}")
+        job.log(f"Reset data     : {options['reset_data']} | Hostname unique: {options['set_hostname']}")
+
+        ok, message = tb_edge.deploy_edge(ip, user, password, options, job.log)
+
+        job.log("Verification de l'etat apres deploiement...")
+        try:
+            state = tb_edge.probe_edge(ip, user, password, edge_dir=options["edge_dir"])
+            store_edge_state(ip, state)
+            label = tb_edge.status_label(state.get("status"))[0]
+            job.log(f"Etat courant   : {label}")
+            if state.get("cloud_hint"):
+                job.log(f"Indice logs    : {state['cloud_hint']}")
+            job.meta["state"] = state
+        except Exception as exception:
+            job.log(f"Verification impossible: {exception}")
+
+        return ok, message
+
+    started, job = job_manager.start(
+        job_key,
+        f"Deploiement Edge {ip}",
+        target,
+        meta={"ip": ip, "edge_key": options["edge_key"]},
+    )
+
+    if not started:
+        return jsonify(
+            {
+                "success": True,
+                "started": False,
+                "running": True,
+                "job": job.snapshot(0),
+                "message": "Un deploiement est deja en cours sur cette carte.",
+            }
+        ), 202
+
+    return jsonify({"success": True, "started": True, "running": True, "job": job.snapshot(0)}), 202
+
+
+@app.route("/api/edge/<ip>/job")
+@login_required
+def api_edge_job(ip):
+    """Retourne les logs incrementaux du deploiement en cours."""
+    offset = parse_int(request.args.get("offset"), 0)
+    snapshot = job_manager.snapshot(f"deploy:{ip}", offset)
+    if not snapshot:
+        return jsonify({"success": True, "job": None})
+    return jsonify({"success": True, "job": snapshot})
+
+
+@app.route("/api/edge/<ip>/control", methods=["POST"])
+@login_required
+def api_edge_control(ip):
+    """start | stop | restart | down de la stack Edge."""
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    action = (payload.get("action") or "").strip()
+    if action not in tb_edge.CONTROL_COMMANDS:
+        return jsonify({"success": False, "error": f"Action invalide: {action}"}), 400
+
+    settings = get_edge_settings()
+    user, password = ssh_credentials()
+    ok, message = tb_edge.control_edge(
+        ip, user, password, action, edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR)
+    )
+
+    state = None
+    if ok:
+        try:
+            state = tb_edge.probe_edge(
+                ip, user, password, edge_dir=settings.get("edge_dir", tb_edge.DEFAULT_EDGE_DIR)
+            )
+            store_edge_state(ip, state)
+        except Exception:
+            state = None
+
+    return jsonify({"success": ok, "message": message, "state": state}), (200 if ok else 500)
+
+
+@app.route("/api/edge/<ip>/logs")
+@login_required
+def api_edge_logs(ip):
+    """Recupere les logs du conteneur tb-edge."""
+    lines = parse_int(request.args.get("lines"), 200)
+    settings = get_edge_settings()
+    user, password = ssh_credentials()
+    ok, output = tb_edge.fetch_edge_logs(ip, user, password, lines=lines)
+    return jsonify({"success": ok, "logs": output}), (200 if ok else 500)
+
+
+@app.route("/api/edge/settings", methods=["GET", "POST"])
+@login_required
+def api_edge_settings():
+    """Lit ou met a jour les reglages Edge globaux (serveur ThingsBoard, etc.)."""
+    if request.method == "GET":
+        return jsonify(get_edge_settings())
+
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    updates = {}
+    if "cloud_host" in payload:
+        valid, error = tb_edge.validate_host(payload.get("cloud_host"))
+        if not valid:
+            return jsonify({"success": False, "error": error}), 400
+        updates["cloud_host"] = error
+    for key in ("cloud_web_url", "edge_version", "edge_dir", "hostname_prefix"):
+        if key in payload and str(payload[key]).strip():
+            updates[key] = str(payload[key]).strip()
+    for key in ("cloud_port", "edge_http_port", "edge_mqtt_port"):
+        if key in payload:
+            updates[key] = parse_int(payload[key], DEFAULT_EDGE_SETTINGS[key])
+    for key in ("cloud_ssl", "install_docker", "set_hostname", "reset_data", "pull_images", "start_edge"):
+        if key in payload:
+            updates[key] = parse_bool(payload[key])
+
+    settings = save_edge_settings(updates)
+    return jsonify({"success": True, "settings": settings})
+
+
+# --------------------------- Serveur ThingsBoard (tenant) --------------------
+
+
+def build_tb_client(payload):
+    settings = get_edge_settings()
+    base_url = (payload.get("tb_url") or settings.get("cloud_web_url") or "").strip()
+    if not base_url and settings.get("cloud_host"):
+        base_url = f"http://{settings['cloud_host']}:8080"
+
+    username = (payload.get("tb_username") or "").strip()
+    password = payload.get("tb_password") or ""
+    verify_ssl = parse_bool(payload.get("tb_verify_ssl", False))
+
+    if not base_url:
+        raise ThingsBoardError("URL du serveur ThingsBoard manquante.")
+    if not username or not password:
+        raise ThingsBoardError("Identifiants tenant ThingsBoard requis.")
+
+    client = ThingsBoardClient(base_url, username, password, verify_ssl=verify_ssl)
+    client.login()
+    if base_url != settings.get("cloud_web_url"):
+        save_edge_settings({"cloud_web_url": base_url})
+    return client
+
+
+@app.route("/api/tb/edges", methods=["POST"])
+@login_required
+def api_tb_edges():
+    """Liste les Edge instances du tenant ThingsBoard."""
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    try:
+        client = build_tb_client(payload)
+        edges = [client.edge_summary(edge) for edge in client.list_edges()]
+        return jsonify({"success": True, "edges": edges, "count": len(edges)})
+    except ThingsBoardError as exception:
+        return jsonify({"success": False, "error": str(exception)}), 400
+
+
+@app.route("/api/tb/edge/lookup", methods=["POST"])
+@login_required
+def api_tb_edge_lookup():
+    """Cherche un Edge par Cle (routing key) ou par nom et renvoie son etat."""
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    routing_key = (payload.get("edge_key") or "").strip()
+    name = (payload.get("edge_name") or "").strip()
+
+    try:
+        client = build_tb_client(payload)
+        edge = None
+        if routing_key:
+            edge = client.find_edge_by_routing_key(routing_key)
+        if not edge and name:
+            edge = client.find_edge_by_name(name)
+
+        if not edge:
+            return jsonify({"success": True, "found": False, "edge": None})
+
+        return jsonify({"success": True, "found": True, "edge": client.edge_summary(edge)})
+    except ThingsBoardError as exception:
+        return jsonify({"success": False, "error": str(exception)}), 400
+
+
+@app.route("/api/tb/edge/create", methods=["POST"])
+@login_required
+def api_tb_edge_create():
+    """
+    Cree un Edge dans le tenant ThingsBoard et retourne sa Cle + son Secret,
+    directement utilisables pour provisionner la carte.
+    """
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return jsonify({"success": False, "error": "Le nom de l'Edge est obligatoire."}), 400
+
+    edge_type = (payload.get("type") or "default").strip() or "default"
+    label = (payload.get("label") or "").strip() or None
+    routing_key = (payload.get("routing_key") or "").strip() or None
+    secret = (payload.get("secret") or "").strip() or None
+
+    if routing_key:
+        valid, error = tb_edge.validate_edge_key(routing_key)
+        if not valid:
+            return jsonify({"success": False, "error": error}), 400
+        routing_key = error
+    if secret:
+        valid, error = tb_edge.validate_edge_secret(secret)
+        if not valid:
+            return jsonify({"success": False, "error": error}), 400
+        secret = error
+
+    try:
+        client = build_tb_client(payload)
+
+        existing = client.find_edge_by_name(name)
+        if existing:
+            return jsonify(
+                {
+                    "success": True,
+                    "created": False,
+                    "edge": client.edge_summary(existing),
+                    "message": f"Un Edge nomme '{name}' existe deja, ses identifiants sont reutilises.",
+                }
+            )
+
+        edge = client.create_edge(name, edge_type, label, routing_key, secret)
+        return jsonify(
+            {
+                "success": True,
+                "created": True,
+                "edge": client.edge_summary(edge),
+                "message": f"Edge '{name}' cree dans le tenant.",
+            }
+        )
+    except ThingsBoardError as exception:
+        return jsonify({"success": False, "error": str(exception)}), 400
+
+
+@app.route("/api/edge/states")
+@login_required
+def api_edge_states():
+    """Retourne les derniers etats Edge connus, par IP."""
+    return jsonify(load_config().get("edge_states", {}))
 
 
 if __name__ == "__main__":
