@@ -51,7 +51,10 @@
     "transfer_image": true,
     "transfer_gateway": true,
     "install_gateway_service": true,
-    "enable_gateway_service": false
+    "enable_gateway_service": false,
+    "tb_username": "tenant@mobilis.dz",
+    "force_image_transfer": false,
+    "preflight_check": true
   },
   "edge_states": {},
   "edge_assignments": {}

@@ -84,6 +84,48 @@ custom** · conteneurs `tb-edge` / `tb-edge-postgres` · contenu de `.env` · lo
 
 ---
 
+## Étape 0 bis — Prérequis et dépendances (obligatoire)
+
+Section **0. Prerequis et dependances** → bouton **Verifier les prerequis**.
+
+Cette couche existe pour une raison précise : un déploiement a échoué **après 6 minutes de
+transfert** parce que la carte cible n'avait pas Docker :
+
+```
+[16:31:14] Chargement de l'image sur la cible (docker load)...
+[16:31:15] bash: line 1: docker: command not found
+[16:31:15] docker load a echoue (code 127).
+```
+
+L'archive de ~1 Go était déjà poussée. Désormais, **rien de long ne démarre avant que les
+dépendances soient vérifiées.**
+
+### Ce qui est contrôlé
+
+| Portée | Vérifications |
+|---|---|
+| **Carte cible** | SSH, root/`sudo -n`, OS+arch, **Docker CE**, plugin compose, **daemon actif**, image edge présente, outils (`gzip`, `gunzip`, `tar`, `awk`, `sed`, `systemctl`), espace disque (8 Go min, 12 Go conseillés), répertoire d'installation |
+| **Carte de référence** | SSH, Docker, **présence de l'image à répliquer**, espace `/tmp` (2 Go), `gzip`/`stat` |
+| **Serveur ModBerry** | `assets/edge_provision.sh`, modules `paramiko`/`requests`, espace `/tmp` (2 Go, relais de l'archive) |
+
+Si Docker doit être installé, on vérifie en plus `curl`/`apt-get`/`dpkg` et la joignabilité
+de `download.docker.com`.
+
+Chaque contrôle est classé **OK** / **Attention** / **Bloquant**, avec le correctif à
+appliquer. Un contrôle bloquant **annule le déploiement avant tout transfert**.
+
+### Installer Docker séparément
+
+Bouton **Installer Docker CE sur la carte** : exécute `edge_provision.sh` en mode
+`DOCKER_ONLY=1` — installe `docker-ce`, le plugin compose, démarre le daemon, déplace
+éventuellement le data-root sur le SSD, **puis s'arrête** sans toucher à la stack Edge.
+Étape indépendante et rejouable.
+
+Le déploiement complet fait la même chose automatiquement : l'ordre des étapes place
+l'installation de Docker **avant** le transfert de l'image.
+
+---
+
 ## Étape 1 — Carte de référence
 
 Section **1. Carte de reference** : bouton **Inventorier** → liste les images `tb-edge`
@@ -93,12 +135,34 @@ Le transfert d'image (`docker save | gzip` → SFTP → `docker load`) est décl
 automatiquement au déploiement si l'image manque sur la cible. Progression affichée en
 direct ; comptez plusieurs dizaines de minutes pour ~2,4 Go.
 
+Avant chaque transfert (et une seconde fois juste avant `docker load`), la présence de
+Docker, du daemon, de `gunzip` et de l'espace disque est revérifiée sur la cible.
+
+### Gérer l'image sur la carte
+
+Section **Image edge sur cette carte** : le stockage des CM5 ne permet pas de conserver
+plusieurs images de ~2,4 Go.
+
+- **Lister les images** — images `tb-edge` présentes, taille, date, espace libre
+- **Supprimer** — arrête la stack (`docker compose down`), retire les conteneurs qui
+  utilisent l'image, puis `docker rmi -f`. Le `.env` et l'identité Edge **ne sont pas
+  touchés**
+- **Transferer l'image manquante** — transfert simple, sans reconfigurer la stack
+- **Remplacer l'image** — supprime l'image existante puis la recharge depuis la carte de
+  référence (équivalent de l'option **Forcer le retransfert** du déploiement)
+
+Sans suppression ni `force`, une image déjà présente n'est jamais retransférée.
+
 ---
 
 ## Étape 2 — Identité Edge dans le tenant
 
-Section **2. Serveur ThingsBoard** : renseignez l'URL et vos identifiants **tenant**
-(utilisés pour l'appel en cours uniquement, jamais stockés), puis :
+Section **2. Serveur ThingsBoard** : l'URL et les identifiants **tenant** sont pré-remplis
+avec les valeurs du parc Mobilis — `tenant@mobilis.dz` / `tenant`. Le mot de passe est
+utilisé pour l'appel en cours uniquement et **n'est jamais stocké** (seul l'identifiant est
+mémorisé). Surchargeables par `MODBERRY_TB_USERNAME` / `MODBERRY_TB_PASSWORD`.
+
+Ensuite :
 
 - **Lister les Edges du tenant** — voir les Edges existants et lesquels sont actifs
 - **Verifier la Cle saisie** — savoir si une Clé correspond à un Edge existant
@@ -122,25 +186,34 @@ Cela remplace la création manuelle via l'interface web, non tenable sur 99+ car
 | Hôte du serveur ThingsBoard | `10.0.0.1` |
 | Port RPC edge | `7071` |
 
-Le déploiement enchaîne trois étapes dans une seule action, avec journal en direct :
+Le déploiement enchaîne quatre étapes dans une seule action, avec journal en direct.
+L'ordre est important : **Docker est installé avant que l'image ne soit transférée.**
 
-1. **Image Docker custom** — `docker save` sur le maître → `docker load` sur la cible
-   (ignoré si l'image est déjà présente)
-2. **Stack** — installation de Docker CE si absent, écriture de `.env` (chmod 600) et
-   `docker-compose.yml`, récupération de `postgres:16`, `docker compose up -d`
-3. **Gateway I/O** — copie de `/opt/mobilis-gateway`, installation de `tb-edge-io.service`
+1. **Prérequis** — contrôle complet (serveur, carte de référence, cible). Un point
+   bloquant arrête le déploiement **immédiatement**, avant tout transfert
+2. **Dépendances Docker** — installe Docker CE / démarre le daemon si nécessaire
+   (mode `DOCKER_ONLY`). C'est ce qui évite l'échec `docker load` code 127
+3. **Image Docker custom** — `docker save` sur le maître → `docker load` sur la cible
+   (ignoré si l'image est déjà présente, sauf **Forcer le retransfert**)
+4. **Stack** — écriture de `.env` (chmod 600) et `docker-compose.yml`, récupération de
+   `postgres:16`, `docker compose up -d`
 
-À la fin, une sonde automatique met l'état à jour.
+Puis, en complément : **Gateway I/O** — copie de `/opt/mobilis-gateway`, installation de
+`tb-edge-io.service`. À la fin, une sonde automatique met l'état à jour.
 
 ### Options avancées
 
 Répertoire, projet compose, ports hôte, mot de passe Postgres, **stockage Docker sur SSD**
 (`/mnt/ssd/docker`, comme sur la carte maître), et les bascules :
 
+- **Verifier les prerequis avant de commencer** — coché par défaut, à ne décocher qu'en
+  connaissance de cause
 - **Purger les volumes de donnees** — `docker compose down -v` + suppression des volumes.
   **Indispensable** sur une carte issue d'une image clonée.
+- **Forcer le retransfert** — supprime l'image existante sur la carte et la recharge
 - **Hostname unique derive du serial** — `modberry-<8 derniers car. du serial CM5>`
-- **Installer Docker CE si absent** — dépôt officiel Debian, arch. détectée (arm64)
+- **Installer Docker CE si absent** — dépôt officiel Debian, arch. détectée (arm64),
+  exécuté **avant** le transfert de l'image
 - **Transferer la gateway I/O** / **Installer l'unite tb-edge-io.service**
 - **Demarrer la gateway** — **décoché par défaut**, voir ci-dessous
 
@@ -199,7 +272,13 @@ Le registre `/api/edge/assignments` liste les identités déjà affectées et em
 | Méthode | Route | Rôle |
 |---|---|---|
 | `GET/POST` | `/api/edge/<ip>/probe` | État complet de l'Edge |
-| `POST` | `/api/edge/<ip>/deploy` | Séquence image → stack → gateway |
+| `GET/POST` | `/api/edge/<ip>/preflight` | **Contrôle des prérequis** (cible + référence + serveur) |
+| `POST` | `/api/edge/<ip>/docker/install` | **Installe Docker CE seul** (`DOCKER_ONLY`) |
+| `GET` | `/api/edge/<ip>/images` | **Liste les images Docker** de la carte |
+| `POST` | `/api/edge/<ip>/images/delete` | **Supprime une image** (arrête la stack) |
+| `POST` | `/api/edge/<ip>/images/transfer` | **Transfère / remplace l'image** (`force`) |
+| `GET` | `/api/preflight/server` | Prérequis du serveur ModBerry Manager |
+| `POST` | `/api/edge/<ip>/deploy` | Séquence prérequis → Docker → image → stack → gateway |
 | `GET` | `/api/edge/<ip>/job?offset=N` | Logs incrémentaux |
 | `POST` | `/api/edge/<ip>/control` | `start` / `stop` / `restart` / `down` |
 | `GET` | `/api/edge/<ip>/logs` | Logs du conteneur `tb-edge` |
@@ -245,6 +324,8 @@ journalctl -u modberry_manager.service -f
 | `MODBERRY_TB_HOST` | `10.0.0.1` | Serveur ThingsBoard |
 | `MODBERRY_TB_RPC_PORT` | `7071` | Port RPC edge |
 | `MODBERRY_TB_URL` | — | URL web du serveur ThingsBoard |
+| `MODBERRY_TB_USERNAME` | `tenant@mobilis.dz` | Identifiant tenant pré-rempli |
+| `MODBERRY_TB_PASSWORD` | `tenant` | Mot de passe tenant pré-rempli (jamais persisté) |
 | `MODBERRY_AUTO_SCAN_INTERVAL_SECONDS` | `7200` | Intervalle du scan automatique |
 
 ---
@@ -254,11 +335,12 @@ journalctl -u modberry_manager.service -f
 ```
 app.py                      application Flask + routes Edge / master / gateway
 tb_edge.py                  sonde SSH, provisioning, garde-fou d'identité
-tb_master.py                réplication depuis la carte de référence
+tb_preflight.py             contrôle des prérequis (Docker, outils, disque, image)
+tb_master.py                réplication + gestion des images depuis la référence
 tb_cloud.py                 client REST du serveur ThingsBoard (tenant)
 jobs.py                     tâches de fond avec logs incrémentaux
-assets/edge_provision.sh    script exécuté sur la carte (idempotent, first-boot)
-templates/edge.html         page de provisioning en 3 étapes
+assets/edge_provision.sh    script exécuté sur la carte (idempotent, DOCKER_ONLY)
+templates/edge.html         page de provisioning (prérequis, image, tenant, déploiement)
 templates/dashboard.html    inventaire + colonne d'état Edge
 config.json                 état persisté (scan, réglages, états, identités)
 ```
